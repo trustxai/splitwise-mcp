@@ -33,9 +33,14 @@ def money(value: object, *, field: str = "amount", allow_zero: bool = False) -> 
         raise ValueError(f"{field} must be a finite decimal")
     if dec < 0 or (dec == 0 and not allow_zero):
         raise ValueError(f"{field} must be {'zero or ' if allow_zero else ''}positive")
-    if dec != dec.quantize(_TWO_PLACES):
+    try:
+        quantized = dec.quantize(_TWO_PLACES)
+    except InvalidOperation:
+        # quantize overflows the default 28-digit context for absurd magnitudes ("1e30").
+        raise ValueError(f"{field} is too large to be a money amount (got {value!s})") from None
+    if dec != quantized:
         raise ValueError(f"{field} must have at most 2 decimal places (got {value!s})")
-    return f"{dec.quantize(_TWO_PLACES):f}"
+    return f"{quantized:f}"
 
 
 def currency_code(value: object, *, field: str = "currency_code") -> str:

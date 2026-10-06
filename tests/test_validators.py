@@ -36,6 +36,14 @@ def test_money_rejects_non_decimals(value: str) -> None:
         money(value)
 
 
+@pytest.mark.parametrize("value", ["1e30", "9" * 40, "1E+28"])
+def test_money_rejects_absurd_magnitudes_readably(value: str) -> None:
+    # quantize() overflows the decimal context for these; the LLM must see a ValueError
+    # message, never a raw decimal.InvalidOperation.
+    with pytest.raises(ValueError, match="too large"):
+        money(value, field="cost")
+
+
 def test_money_rejects_more_than_two_places() -> None:
     with pytest.raises(ValueError, match="at most 2 decimal places"):
         money("1.005", field="cost")
