@@ -295,6 +295,9 @@ class CreateExpenseInput(_ExpenseFields):
             duplicates = sorted({uid for uid in ids if ids.count(uid) > 1})
             if duplicates:
                 raise ValueError(f"equal_split_between lists user id(s) {duplicates} more than once")
+            too_small = equal_split_problem(self.cost, len(ids))
+            if too_small:
+                raise ValueError(too_small)
             if self.paid_by_user_id is not None and self.paid_by_user_id not in ids:
                 raise ValueError(
                     f"paid_by_user_id {self.paid_by_user_id} is not in equal_split_between {ids} — include the "
@@ -369,13 +372,27 @@ def shares_problem(cost: str | None, shares: list[ShareInput]) -> str | None:
     )
 
 
+def equal_split_problem(cost: str, count: int) -> str | None:
+    """Why `cost` cannot be split equally between `count` people, or None (needs ≥ 0.01 each)."""
+    if Decimal(cost) < _CENT * count:
+        return (
+            f"cost too small to split among {count} people — {Decimal(cost):.2f} is less than 0.01 each; "
+            "use explicit shares instead"
+        )
+    return None
+
+
 def equal_split(cost: str, user_ids: list[int], payer_id: int) -> list[ShareInput]:
     """Split `cost` equally between `user_ids`; the payer paid everything and absorbs the leftover cents.
 
     Each owed share is cost / n rounded DOWN to the cent; the remainder (0 ≤ r < n cents)
     goes on the payer's owed share so both sums close exactly: 10.00 / 3 → 3.34 (payer),
-    3.33, 3.33.
+    3.33, 3.33. Raises `ValueError` when the cost is under one cent per person (the
+    non-payers would get 0.00/0.00 shares).
     """
+    problem = equal_split_problem(cost, len(user_ids))
+    if problem:
+        raise ValueError(problem)
     total = Decimal(cost)
     count = len(user_ids)
     base = (total / count).quantize(_CENT, rounding=ROUND_DOWN)
@@ -509,18 +526,50 @@ def _shares_table(expense: Mapping[str, Any]) -> list[str]:
     return lines
 
 
-def _render_saved(verb: str, body: Mapping[str, Any]) -> str:
-    """Confirmation for create/update: echo only what Splitwise returned."""
+def _post_body(resp: Any) -> dict[str, Any] | None:
+    """The JSON object a write answered with, or None when the body is not a readable JSON object.
+
+    A 200 with an unreadable body must not surface as a generic parse failure: the write
+    may well have happened, so the caller reports the outcome as UNKNOWN instead.
+    """
+    try:
+        body = resp.json()
+    except ValueError:  # json.JSONDecodeError is a ValueError
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def _unknown_outcome(read_back: str) -> str:
+    return (
+        "Error: Splitwise answered without a readable body — outcome UNKNOWN; read back with "
+        f"{read_back} before retrying (a blind retry can duplicate or repeat the change)."
+    )
+
+
+_SAVED_VERBS = {"create": "created", "update": "updated"}
+_SAVED_READ_BACK = {"create": "splitwise_get_expenses", "update": "splitwise_get_expense"}
+
+
+def _render_saved(action: Literal["create", "update"], body: Mapping[str, Any]) -> str:
+    """Confirmation for create/update: echo only what Splitwise returned.
+
+    The header claims `created`/`updated` only when Splitwise returned an expense object;
+    otherwise the outcome is reported as NOT confirmed.
+    """
     errors = body.get("errors")
     errors_text = "absent" if "errors" not in body else f"`{json.dumps(errors)}`"
     expenses = [e for e in body.get("expenses") or [] if isinstance(e, Mapping)]
-    lines = [f"# Expense {verb}", "", f"- **errors**: {errors_text}"]
     if not expenses:
-        lines.append(
-            "- Splitwise returned no expense object. Read it back with splitwise_get_expenses before retrying "
-            "(a blind retry can duplicate the expense)."
+        return "\n".join(
+            [
+                f"# Expense {action} — outcome NOT confirmed",
+                "",
+                f"- **errors**: {errors_text}",
+                f"- Splitwise returned no expense object. Read it back with {_SAVED_READ_BACK[action]} before "
+                "retrying (a blind retry can duplicate the expense).",
+            ]
         )
-        return "\n".join(lines)
+    lines = [f"# Expense {_SAVED_VERBS[action]}", "", f"- **errors**: {errors_text}"]
     lines.append(f"- **expenses returned**: {len(expenses)}")
     for expense in expenses:
         currency = str(expense.get("currency_code") or "")
@@ -739,10 +788,10 @@ async def splitwise_get_expense(params: GetExpenseInput) -> str:
         resp = await get_client().request("GET", f"/get_expense/{params.expense_id}")
         raw = resp.json().get("expense")
         expense: dict[str, Any] = raw if isinstance(raw, dict) else {}
-        if params.response_format is ResponseFormat.JSON:
-            return clip_response(to_json(expense))
         if not expense:
             return f"Error: Splitwise returned no expense object for id {params.expense_id}."
+        if params.response_format is ResponseFormat.JSON:
+            return clip_response(to_json(expense))
 
         currency = str(expense.get("currency_code") or "")
         category = expense.get("category")
@@ -903,7 +952,10 @@ async def splitwise_create_expense(params: CreateExpenseInput) -> str:
                 return f"Error: {problem} Nothing was sent."
             body.update(flatten_shares(shares))
         resp = await client.request("POST", "/create_expense", data=body)
-        return clip_response(_render_saved("created", resp.json()))
+        saved = _post_body(resp)
+        if saved is None:
+            return _unknown_outcome("splitwise_get_expenses")
+        return clip_response(_render_saved("create", saved))
     except Exception as exc:
         return handle_api_error(exc)
 
@@ -928,6 +980,9 @@ async def splitwise_update_expense(params: UpdateExpenseInput) -> str:
     the complete new split, so list EVERY participant with their paid_share and
     owed_share — sending only the person who changed drops everyone else from the
     expense. Read the current split first with `splitwise_get_expense`.
+
+    No undo tool — to revert, re-send the previous values read with
+    `splitwise_get_expense` first.
 
     When `shares` is given, Σ paid_share and Σ owed_share must each equal the cost: the new
     `cost` if you pass one, otherwise the expense's current cost (read once with
@@ -982,7 +1037,10 @@ async def splitwise_update_expense(params: UpdateExpenseInput) -> str:
                 return f"Error: {problem} (checked against {source}). Nothing was sent."
             body.update(flatten_shares(params.shares))
         resp = await client.request("POST", f"/update_expense/{params.expense_id}", data=body)
-        return clip_response(_render_saved("updated", resp.json()))
+        saved = _post_body(resp)
+        if saved is None:
+            return _unknown_outcome(f"splitwise_get_expense (expense_id={params.expense_id})")
+        return clip_response(_render_saved("update", saved))
     except Exception as exc:
         return handle_api_error(exc)
 
@@ -1024,8 +1082,10 @@ async def splitwise_delete_expense(params: ExpenseIdInput) -> str:
     """
     try:
         resp = await get_client().request("POST", f"/delete_expense/{params.expense_id}")
-        body = resp.json()
-        success = body.get("success") if isinstance(body, dict) else None
+        body = _post_body(resp)
+        if body is None:
+            return _unknown_outcome(f"splitwise_get_expense (expense_id={params.expense_id})")
+        success = body.get("success")
         if success is True:
             return (
                 f"Expense {params.expense_id} deleted — Splitwise answered `success: true`. "
@@ -1076,8 +1136,10 @@ async def splitwise_undelete_expense(params: ExpenseIdInput) -> str:
     """
     try:
         resp = await get_client().request("POST", f"/undelete_expense/{params.expense_id}")
-        body = resp.json()
-        success = body.get("success") if isinstance(body, dict) else None
+        body = _post_body(resp)
+        if body is None:
+            return _unknown_outcome(f"splitwise_get_expense (expense_id={params.expense_id})")
+        success = body.get("success")
         if success is True:
             return f"Expense {params.expense_id} restored — Splitwise answered `success: true`."
         return (

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -41,8 +42,22 @@ class _FakeResponse:
         return self._payload
 
 
+class _NonJsonResponse(_FakeResponse):
+    """A 200 whose body is not JSON (e.g. an HTML error page from a proxy)."""
+
+    def __init__(self) -> None:
+        super().__init__(None)
+
+    def json(self) -> Any:
+        raise json.JSONDecodeError("Expecting value", "<html>Bad gateway</html>", 0)
+
+
 class _FakeClient:
-    """Routes by path; records every call (method, path, kwargs)."""
+    """Routes by path; records every call (method, path, kwargs).
+
+    A route value that is an Exception is raised; a `_FakeResponse` is returned as-is;
+    anything else is wrapped as the JSON payload.
+    """
 
     def __init__(self, routes: dict[str, Any] | None = None) -> None:
         self._routes = routes or {}
@@ -54,6 +69,8 @@ class _FakeClient:
         payload = self._routes.get(path)
         if isinstance(payload, Exception):
             raise payload
+        if isinstance(payload, _FakeResponse):
+            return payload
         return _FakeResponse(payload if payload is not None else {})
 
 
@@ -273,6 +290,17 @@ async def test_get_expense_not_found_is_routed_through_handle_api_error(monkeypa
     assert result.startswith("Error (404): Not found – Expense not found.")
 
 
+@pytest.mark.parametrize("response_format", ["markdown", "json"])
+async def test_get_expense_missing_object_is_an_error_in_both_formats(
+    monkeypatch: pytest.MonkeyPatch, response_format: str
+) -> None:
+    _install(monkeypatch, {"/get_expense/9": {}})
+
+    result = await splitwise_get_expense(GetExpenseInput(expense_id=9, response_format=response_format))
+
+    assert result == "Error: Splitwise returned no expense object for id 9."
+
+
 def test_expense_id_must_be_positive() -> None:
     with pytest.raises(ValidationError):
         ExpenseIdInput(expense_id=0)
@@ -296,7 +324,7 @@ def test_equal_split_puts_remainder_cents_on_payer() -> None:
 
 @pytest.mark.parametrize(
     ("cost", "count"),
-    [("0.05", 3), ("100.00", 7), ("0.01", 2), ("33.33", 4), ("1234.57", 9)],
+    [("0.05", 3), ("100.00", 7), ("0.02", 2), ("0.03", 3), ("33.33", 4), ("1234.57", 9)],
 )
 def test_equal_split_always_closes(cost: str, count: int) -> None:
     ids = list(range(10, 10 + count))
@@ -304,8 +332,24 @@ def test_equal_split_always_closes(cost: str, count: int) -> None:
 
     assert shares_problem(cost, shares) is None
     owed = [s.owed_share for s in shares]
-    # Everyone but the payer owes the same; the payer owes at most n-1 cents more.
+    # Everyone but the payer owes the same, never less than a cent; the payer owes at most n-1 cents more.
     assert len(set(owed[:-1])) == 1
+    assert Decimal(owed[0]) >= Decimal("0.01")
+    assert Decimal(owed[-1]) - Decimal(owed[0]) < Decimal("0.01") * count
+
+
+async def test_equal_split_refuses_cost_under_one_cent_each(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _install(monkeypatch)
+
+    with pytest.raises(ValueError, match="cost too small to split among 3 people"):
+        equal_split("0.02", [1, 2, 3], payer_id=1)
+    with pytest.raises(ValidationError, match="cost too small to split among 3 people"):
+        CreateExpenseInput(cost="0.01", description="x", equal_split_between=[1, 2, 3])
+    # Through the MCP surface: refused before any call, including the /get_current_user lookup.
+    arguments = {"params": {"cost": "0.01", "description": "x", "equal_split_between": [1, 2, 3]}}
+    with pytest.raises(ToolError, match="cost too small to split among 3 people"):
+        await mcp.call_tool("splitwise_create_expense", arguments)
+    assert fake.calls == []
 
 
 def test_shares_problem_names_the_mismatch() -> None:
@@ -392,7 +436,7 @@ async def test_create_split_equally_in_group(monkeypatch: pytest.MonkeyPatch) ->
 async def test_create_explicit_shares_flattened(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _install(monkeypatch, {"/create_expense": CREATED})
 
-    await splitwise_create_expense(
+    result = await splitwise_create_expense(
         CreateExpenseInput(
             cost="50.00",
             description="Groceries",
@@ -428,6 +472,9 @@ async def test_create_explicit_shares_flattened(monkeypatch: pytest.MonkeyPatch)
             },
         )
     ]
+    assert result.startswith("# Expense created")
+    assert "- **errors**: `{}`" in result
+    assert "## Expense 777:" in result
 
 
 async def test_create_equal_split_between_learns_me_and_assigns_remainder(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -469,12 +516,14 @@ async def test_create_equal_split_between_learns_me_and_assigns_remainder(monkey
 async def test_create_equal_split_between_with_explicit_payer_skips_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _install(monkeypatch, {"/create_expense": CREATED})
 
-    await splitwise_create_expense(
+    result = await splitwise_create_expense(
         CreateExpenseInput(
             cost="7.00", description="Coffee", group_id=55, equal_split_between=[4, 5], paid_by_user_id=5
         )
     )
 
+    assert result.startswith("# Expense created")
+    assert "- **errors**: `{}`" in result
     assert [call[:2] for call in fake.calls] == [("POST", "/create_expense")]
     data = fake.calls[0][2]["data"]
     assert data["users__1__paid_share"] == "7.00"
@@ -592,15 +641,37 @@ async def test_create_envelope_error_is_reported(monkeypatch: pytest.MonkeyPatch
     assert result == "Error: Splitwise rejected the request to /create_expense: Cost must equal the sum of shares"
 
 
-async def test_create_reports_empty_expenses_without_claiming_success(monkeypatch: pytest.MonkeyPatch) -> None:
-    _install(monkeypatch, {"/create_expense": {"expenses": [], "errors": {}}})
+@pytest.mark.parametrize(
+    ("body", "errors_line"),
+    [({"expenses": [], "errors": {}}, "- **errors**: `{}`"), ({}, "- **errors**: absent")],
+)
+async def test_create_reports_empty_expenses_without_claiming_success(
+    monkeypatch: pytest.MonkeyPatch, body: dict[str, Any], errors_line: str
+) -> None:
+    _install(monkeypatch, {"/create_expense": body})
 
     result = await splitwise_create_expense(
         CreateExpenseInput(cost="10.00", description="x", split_equally=True, group_id=5)
     )
 
-    assert "Splitwise returned no expense object" in result
+    assert not result.startswith("# Expense created")
+    assert result.startswith("# Expense create — outcome NOT confirmed")
+    assert errors_line in result
+    assert "Read it back with splitwise_get_expenses before retrying" in result
     assert "## Expense" not in result
+
+
+async def test_create_non_json_200_reports_unknown_outcome(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _install(monkeypatch, {"/create_expense": _NonJsonResponse()})
+
+    result = await splitwise_create_expense(
+        CreateExpenseInput(cost="10.00", description="x", split_equally=True, group_id=5)
+    )
+
+    assert result.startswith("Error: Splitwise answered without a readable body — outcome UNKNOWN")
+    assert "read back with splitwise_get_expenses before retrying" in result
+    assert "JSONDecodeError" not in result
+    assert [call[:2] for call in fake.calls] == [("POST", "/create_expense")]
 
 
 async def test_create_is_refused_by_the_client_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -634,6 +705,8 @@ def test_update_docstring_warns_that_shares_replace_all() -> None:
     doc = splitwise_update_expense.__doc__ or ""
     assert "WARNING: `shares` REPLACES ALL existing shares" in doc
     assert "REPLACES ALL existing shares" in (UpdateExpenseInput.model_fields["shares"].description or "")
+    flat = " ".join(doc.split())
+    assert "No undo tool — to revert, re-send the previous values read with `splitwise_get_expense` first." in flat
 
 
 async def test_update_single_field_sends_only_that_field(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -650,7 +723,7 @@ async def test_update_single_field_sends_only_that_field(monkeypatch: pytest.Mon
 async def test_update_shares_without_cost_checks_against_current_cost(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _install(monkeypatch, {"/get_expense/101": {"expense": DINNER}, "/update_expense/101": UPDATED})
 
-    await splitwise_update_expense(
+    result = await splitwise_update_expense(
         UpdateExpenseInput(
             expense_id=101,
             shares=[
@@ -659,6 +732,10 @@ async def test_update_shares_without_cost_checks_against_current_cost(monkeypatc
             ],
         )
     )
+
+    assert result.startswith("# Expense updated")
+    assert "- **errors**: `{}`" in result
+    assert "## Expense 101: Dinner (tip)" in result
 
     assert fake.calls == [
         ("GET", "/get_expense/101", {}),
@@ -700,7 +777,7 @@ async def test_update_shares_mismatch_against_current_cost_sends_nothing(monkeyp
 async def test_update_cost_with_shares_validates_locally(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _install(monkeypatch, {"/update_expense/101": UPDATED})
 
-    await splitwise_update_expense(
+    result = await splitwise_update_expense(
         UpdateExpenseInput(
             expense_id=101,
             cost="60",
@@ -712,6 +789,8 @@ async def test_update_cost_with_shares_validates_locally(monkeypatch: pytest.Mon
         )
     )
 
+    assert result.startswith("# Expense updated")
+    assert "- **errors**: `{}`" in result
     assert [call[:2] for call in fake.calls] == [("POST", "/update_expense/101")]
     assert fake.calls[0][2]["data"]["cost"] == "60.00"
     assert fake.calls[0][2]["data"]["group_id"] == 0
@@ -773,6 +852,30 @@ async def test_delete_expense_without_success_field_does_not_claim_it(monkeypatc
 
     assert result.startswith("Splitwise answered `success: null` for deleting expense 101")
     assert "deleted —" not in result
+
+
+async def test_delete_expense_list_body_reports_unknown_outcome(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _install(monkeypatch, {"/delete_expense/101": [{"success": True}]})
+
+    result = await splitwise_delete_expense(ExpenseIdInput(expense_id=101))
+
+    assert result.startswith("Error: Splitwise answered without a readable body — outcome UNKNOWN")
+    assert "read back with splitwise_get_expense (expense_id=101) before retrying" in result
+    assert "deleted —" not in result
+    assert fake.calls == [("POST", "/delete_expense/101", {})]
+
+
+@pytest.mark.parametrize("tool", ["update", "undelete"])
+async def test_other_writes_report_unknown_outcome_on_non_json_200(monkeypatch: pytest.MonkeyPatch, tool: str) -> None:
+    _install(monkeypatch, {f"/{tool}_expense/101": _NonJsonResponse()})
+
+    if tool == "update":
+        result = await splitwise_update_expense(UpdateExpenseInput(expense_id=101, description="x"))
+    else:
+        result = await splitwise_undelete_expense(ExpenseIdInput(expense_id=101))
+
+    assert result.startswith("Error: Splitwise answered without a readable body — outcome UNKNOWN")
+    assert "splitwise_get_expense (expense_id=101)" in result
 
 
 async def test_undelete_expense(monkeypatch: pytest.MonkeyPatch) -> None:
