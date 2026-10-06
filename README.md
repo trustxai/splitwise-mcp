@@ -71,7 +71,7 @@ client that has writes enabled.
 ## Available Tools
 
 <!-- TOOL TABLE START -->
-All **28 tools**, grouped by module. 🔒 = refused unless `SPLITWISE_ALLOW_WRITES=1`.
+All **33 tools**, grouped by module. 🔒 = refused unless `SPLITWISE_ALLOW_WRITES=1`.
 
 | Tool | Description |
 |---|---|
@@ -105,6 +105,12 @@ All **28 tools**, grouped by module. 🔒 = refused unless `SPLITWISE_ALLOW_WRIT
 | **Balances** | |
 | `splitwise_get_balances` | Summarise who owes you and whom you owe, per friend and per currency. |
 | `splitwise_get_group_balances` | Show each member's balance in one group and who should pay whom to settle it. |
+| **Lookup — categories, currencies, name resolution** | |
+| `splitwise_get_categories` | List Splitwise's expense categories: each parent with its subcategories and their ids. |
+| `splitwise_get_currencies` | List the currency codes Splitwise accepts, optionally filtered by a substring. |
+| `splitwise_resolve_category` | Turn a category name into the subcategory id an expense needs, with ranked fuzzy candidates. |
+| `splitwise_resolve_friend` | Turn a friend's name (or email) into their Splitwise user id, with ranked fuzzy candidates. |
+| `splitwise_resolve_group` | Turn a group's name into its Splitwise group id, with ranked fuzzy candidates. |
 | **Comments** | |
 | `splitwise_create_comment` 🔒 | Add a comment to a Splitwise expense. |
 | `splitwise_delete_comment` 🔒 | Delete a comment from a Splitwise expense (destructive; comments have no undelete). |
