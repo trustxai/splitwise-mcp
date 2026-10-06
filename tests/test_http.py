@@ -25,6 +25,7 @@ from splitwise_mcp.config import MIN_BEARER_LENGTH, Settings, get_settings
 from splitwise_mcp.http import (
     BearerAuthMiddleware,
     allowed_hosts_for,
+    allowed_origins_for,
     build_app,
     normalize_path,
     serve,
@@ -112,11 +113,12 @@ class _Recorder:
             await send({"type": "http.response.body", "body": b""})
 
 
-def _assert_challenge(response: httpx.Response) -> None:
+def _assert_challenge(response: httpx.Response, *, with_body: bool = True) -> None:
     assert response.status_code == 401
     assert response.headers["www-authenticate"] == 'Bearer realm="splitwise-mcp"'
     assert response.headers["content-type"] == "application/json"
-    assert response.json() == {"error": "unauthorized"}
+    if with_body:
+        assert response.json() == {"error": "unauthorized"}
 
 
 # --- the bearer gate ---------------------------------------------------------------
@@ -176,14 +178,14 @@ async def test_malformed_authorization_is_401(headers: list[tuple[str, str]]) ->
     assert inner.scopes == []
 
 
-@pytest.mark.parametrize("path", ["/", "/mcp", "/mcp/", "/does-not-exist", "/mcp/../admin"])
-@pytest.mark.parametrize("method", ["GET", "POST", "DELETE", "OPTIONS"])
+@pytest.mark.parametrize("path", ["/", "/mcp", "/mcp/", "/mcp//", "/does-not-exist", "/mcp/../admin"])
+@pytest.mark.parametrize("method", ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
 async def test_every_unauthenticated_http_request_is_401_before_routing(method: str, path: str) -> None:
     # A 404/405/307 here would mean the request reached the SDK's router unauthenticated.
     app = build_app(FastMCP("splitwise_mcp"), _settings())
     async with _client(app) as client:
         response = await client.request(method, path, headers=MCP_HEADERS)
-    _assert_challenge(response)
+    _assert_challenge(response, with_body=method != "HEAD")
 
 
 async def test_rejections_log_nothing_about_the_token(caplog: pytest.LogCaptureFixture) -> None:
@@ -305,6 +307,18 @@ async def test_trailing_slash_is_served_not_redirected() -> None:
     assert _sse_json(response.text)["result"]["serverInfo"]["name"] == "splitwise_mcp"
 
 
+@pytest.mark.parametrize("path", ["/mcp//", "/mcp///", "/mcp/x/"])
+async def test_authorized_near_miss_paths_are_404_never_a_redirect(path: str) -> None:
+    # With Starlette's slash redirects on, `/mcp//` answered 307 to `<scheme>://<Host>/mcp`;
+    # behind Funnel that Location is another backend, and a redirect-following client
+    # would re-send the bearer there.
+    app = build_app(FastMCP("splitwise_mcp"), _settings())
+    async with _lifespan(app), _client(app) as client:
+        response = await client.post(path, json=INITIALIZE, headers=_auth())
+    assert response.status_code == 404, (response.status_code, response.headers)
+    assert "location" not in response.headers
+
+
 async def test_custom_path_is_honoured() -> None:
     app = build_app(FastMCP("splitwise_mcp"), _settings(splitwise_mcp_path="splitwise/"))
     async with _lifespan(app), _client(app) as client:
@@ -350,6 +364,53 @@ async def test_host_with_unlisted_port_is_rejected_when_pinned() -> None:
     assert response.status_code == 421
 
 
+async def test_ipv6_loopback_host_is_accepted_when_pinned() -> None:
+    settings = _settings(splitwise_mcp_allowed_hosts="ax42.tail8f6c35.ts.net")
+    app = build_app(FastMCP("splitwise_mcp"), settings)
+    async with _lifespan(app), _client(app) as client:
+        response = await client.post("http://[::1]:8765/mcp", json=INITIALIZE, headers=_auth())
+    assert response.status_code == 200, response.text
+
+
+async def test_configured_origin_is_accepted_and_others_are_403() -> None:
+    settings = _settings(
+        splitwise_mcp_allowed_hosts="ax42.tail8f6c35.ts.net",
+        splitwise_mcp_allowed_origins="https://grok.com",
+    )
+    app = build_app(FastMCP("splitwise_mcp"), settings)
+    async with _lifespan(app), _client(app) as client:
+        listed = await client.post(f"{BASE}/mcp", json=INITIALIZE, headers={**_auth(), "Origin": "https://grok.com"})
+        unlisted = await client.post(f"{BASE}/mcp", json=INITIALIZE, headers={**_auth(), "Origin": "https://x.ai"})
+    assert listed.status_code == 200, listed.text
+    assert unlisted.status_code == 403
+
+
+async def test_foreign_origin_is_403_by_default() -> None:
+    settings = _settings(splitwise_mcp_allowed_hosts="ax42.tail8f6c35.ts.net")
+    app = build_app(FastMCP("splitwise_mcp"), settings)
+    async with _lifespan(app), _client(app) as client:
+        response = await client.post(f"{BASE}/mcp", json=INITIALIZE, headers={**_auth(), "Origin": "https://grok.com"})
+    assert response.status_code == 403
+
+
+def test_allowed_origins_mirror_hosts_then_append_configured() -> None:
+    settings = _settings(
+        splitwise_mcp_allowed_hosts="a.example",
+        splitwise_mcp_allowed_origins="https://grok.com, https://a.example",
+    )
+    assert allowed_origins_for(settings) == [
+        "https://a.example",
+        "http://a.example",
+        "https://127.0.0.1:8765",
+        "http://127.0.0.1:8765",
+        "https://localhost:8765",
+        "http://localhost:8765",
+        "https://[::1]:8765",
+        "http://[::1]:8765",
+        "https://grok.com",
+    ]
+
+
 # --- SDK settings + parsing ------------------------------------------------------------
 
 
@@ -372,7 +433,7 @@ def test_build_app_configures_the_sdk_settings() -> None:
     security = mcp.settings.transport_security
     assert security is not None
     assert security.enable_dns_rebinding_protection is True
-    assert security.allowed_hosts == ["api.example.com", "127.0.0.1:9000", "localhost:9000"]
+    assert security.allowed_hosts == ["api.example.com", "127.0.0.1:9000", "localhost:9000", "[::1]:9000"]
     assert "https://api.example.com" in security.allowed_origins
     assert "http://127.0.0.1:9000" in security.allowed_origins
 
@@ -383,21 +444,24 @@ def test_dns_rebinding_protection_is_off_without_configured_hosts() -> None:
     security = mcp.settings.transport_security
     assert security is not None
     assert security.enable_dns_rebinding_protection is False
-    # The local pair is still listed, ready for the day a host is configured.
-    assert security.allowed_hosts == ["127.0.0.1:8765", "localhost:8765"]
+    # The local loopbacks are still listed, ready for the day a host is configured.
+    assert security.allowed_hosts == ["127.0.0.1:8765", "localhost:8765", "[::1]:8765"]
     assert mcp.settings.stateless_http is True
 
 
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        ("", ["127.0.0.1:8765", "localhost:8765"]),
-        (" , ,", ["127.0.0.1:8765", "localhost:8765"]),
+        ("", ["127.0.0.1:8765", "localhost:8765", "[::1]:8765"]),
+        (" , ,", ["127.0.0.1:8765", "localhost:8765", "[::1]:8765"]),
         (
             " a.example , ,b.example:8443,a.example ",
-            ["a.example", "b.example:8443", "127.0.0.1:8765", "localhost:8765"],
+            ["a.example", "b.example:8443", "127.0.0.1:8765", "localhost:8765", "[::1]:8765"],
         ),
-        ("localhost:8765,ax42.tail8f6c35.ts.net", ["localhost:8765", "ax42.tail8f6c35.ts.net", "127.0.0.1:8765"]),
+        (
+            "localhost:8765,ax42.tail8f6c35.ts.net",
+            ["localhost:8765", "ax42.tail8f6c35.ts.net", "127.0.0.1:8765", "[::1]:8765"],
+        ),
     ],
 )
 def test_allowed_hosts_parsing(raw: str, expected: list[str]) -> None:
@@ -406,7 +470,7 @@ def test_allowed_hosts_parsing(raw: str, expected: list[str]) -> None:
 
 def test_allowed_hosts_follow_the_port() -> None:
     hosts = allowed_hosts_for(_settings(splitwise_mcp_port=9123, splitwise_mcp_allowed_hosts="x.example"))
-    assert hosts == ["x.example", "127.0.0.1:9123", "localhost:9123"]
+    assert hosts == ["x.example", "127.0.0.1:9123", "localhost:9123", "[::1]:9123"]
 
 
 @pytest.mark.parametrize(
@@ -489,7 +553,14 @@ def test_serve_runs_uvicorn_without_access_log_on_loopback(run_spy: _RunSpy, mon
     args, kwargs = run_spy.calls[0]
     assert len(args) == 1
     assert isinstance(args[0], BearerAuthMiddleware)
-    assert kwargs == {"host": "127.0.0.1", "port": 8899, "log_level": "warning", "access_log": False}
+    assert kwargs == {
+        "host": "127.0.0.1",
+        "port": 8899,
+        "log_level": "warning",
+        "access_log": False,
+        "proxy_headers": False,
+        "server_header": False,
+    }
     assert mcp.settings.port == 8899
 
 

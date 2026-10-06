@@ -29,6 +29,7 @@ from splitwise_mcp.config import MIN_BEARER_LENGTH, get_settings
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
+    from starlette.applications import Starlette
     from starlette.types import ASGIApp, Receive, Scope, Send
 
     from splitwise_mcp.config import Settings
@@ -94,14 +95,14 @@ class BearerAuthMiddleware:
 
 
 class _TrailingSlashAlias:
-    """Serve `<path>/` as `<path>` instead of letting Starlette redirect it.
+    """Serve `<path>/` as `<path>` (the SDK mounts the endpoint at exactly `<path>`).
 
-    The SDK mounts the endpoint at exactly `<path>`; Starlette answers `<path>/` with a 307
-    to `http://<Host><path>`. Behind Tailscale Funnel (`--set-path=/splitwise
-    http://127.0.0.1:8765/mcp`, research/03) the public URL `…/splitwise/` arrives here as
-    `/mcp/`, and that redirect would drop both the `https` scheme and the `/splitwise`
-    prefix. Rewriting the path in place keeps one canonical endpoint reachable under both
-    spellings. Sits INSIDE the bearer middleware, so it only ever sees authorized requests.
+    Behind Tailscale Funnel (`--set-path=/splitwise http://127.0.0.1:8765/mcp`,
+    research/03) the public URL `…/splitwise/` arrives here as `/mcp/`. Starlette's own
+    answer would be a 307 to `<scheme>://<Host><path>`, which drops the `/splitwise`
+    prefix; `build_app` turns those redirects off and this alias serves the one spelling
+    that matters. Sits INSIDE the bearer middleware, so it only ever sees authorized
+    requests.
     """
 
     def __init__(self, app: ASGIApp, path: str) -> None:
@@ -124,16 +125,33 @@ def allowed_hosts_for(settings: Settings) -> list[str]:
     """Host header values accepted when DNS-rebinding protection is on.
 
     `SPLITWISE_MCP_ALLOWED_HOSTS` (comma-separated, whitespace and blanks dropped,
-    de-duplicated, order kept) plus — always — `127.0.0.1:<port>` and `localhost:<port>`
-    so a local health probe keeps working. Matching in the SDK is exact (or `name:*` for
-    any port): `example.com` does not match `example.com:443`.
+    de-duplicated, order kept) plus — always — `127.0.0.1:<port>`, `localhost:<port>` and
+    `[::1]:<port>` so a local health probe keeps working on every loopback the config
+    accepts. Matching in the SDK is exact (or `name:*` for any port): `example.com` does
+    not match `example.com:443`.
     """
     hosts = list(settings.allowed_hosts)
     port = settings.splitwise_mcp_port
-    for local in (f"127.0.0.1:{port}", f"localhost:{port}"):
+    for local in (f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"):
         if local not in hosts:
             hosts.append(local)
     return hosts
+
+
+def allowed_origins_for(settings: Settings) -> list[str]:
+    """Origin header values accepted when DNS-rebinding protection is on.
+
+    Every accepted host mirrored as `https://<host>` and `http://<host>` (same-origin
+    clients), then `SPLITWISE_MCP_ALLOWED_ORIGINS` — the escape hatch for a cloud client
+    that sends its own Origin. De-duplicated, order kept. A request without an `Origin`
+    header is never checked against this list.
+    """
+    origins: list[str] = []
+    mirrored = [f"{scheme}://{host}" for host in allowed_hosts_for(settings) for scheme in ("https", "http")]
+    for origin in [*mirrored, *settings.allowed_origins]:
+        if origin not in origins:
+            origins.append(origin)
+    return origins
 
 
 def build_app(mcp: FastMCP, settings: Settings) -> ASGIApp:
@@ -142,13 +160,18 @@ def build_app(mcp: FastMCP, settings: Settings) -> ASGIApp:
     FastMCP reads its HTTP settings when `streamable_http_app()` first builds the session
     manager, so they are set here, before that call. DNS-rebinding protection (Host /
     Origin pinning) is enabled only when `SPLITWISE_MCP_ALLOWED_HOSTS` is non-empty; the
-    accepted Origins mirror the accepted hosts (`http://` and `https://`), so a
-    same-origin client passes and a request carrying any foreign `Origin` gets 403. A
-    request without an `Origin` header (server-to-server, curl) is unaffected.
+    accepted Origins are `allowed_origins_for(settings)`, so a same-origin client passes,
+    an Origin listed in `SPLITWISE_MCP_ALLOWED_ORIGINS` passes, and any other `Origin`
+    gets 403. A request without an `Origin` header (server-to-server, curl) is unaffected.
+
+    Starlette's slash redirects are turned off: a redirect is built from the Host and
+    (behind a proxy) forwarded scheme, so `/mcp//` would 307 to `https://<public
+    host>/mcp` — on ax42 that is a different backend, and a redirect-following client
+    would re-send the bearer there. `<path>/` is served by the alias instead; any other
+    near-miss is a plain 404.
     """
     path = normalize_path(settings.splitwise_mcp_path)
     configured = settings.allowed_hosts
-    hosts = allowed_hosts_for(settings)
 
     mcp.settings.host = settings.splitwise_mcp_host
     mcp.settings.port = settings.splitwise_mcp_port
@@ -157,11 +180,12 @@ def build_app(mcp: FastMCP, settings: Settings) -> ASGIApp:
     mcp.settings.json_response = False
     mcp.settings.transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=bool(configured),
-        allowed_hosts=hosts,
-        allowed_origins=[f"{scheme}://{host}" for host in hosts for scheme in ("https", "http")],
+        allowed_hosts=allowed_hosts_for(settings),
+        allowed_origins=allowed_origins_for(settings),
     )
 
-    inner: ASGIApp = mcp.streamable_http_app()
+    inner: Starlette = mcp.streamable_http_app()
+    inner.router.redirect_slashes = False
     return BearerAuthMiddleware(_TrailingSlashAlias(inner, path), settings.splitwise_mcp_bearer)
 
 
@@ -195,4 +219,8 @@ def serve(mcp: FastMCP) -> None:
         port=settings.splitwise_mcp_port,
         log_level="warning",
         access_log=False,
+        # Nothing here needs X-Forwarded-*: with redirects off, no URL is built from them.
+        proxy_headers=False,
+        # Every 401 on the public URL would otherwise advertise `server: uvicorn`.
+        server_header=False,
     )
