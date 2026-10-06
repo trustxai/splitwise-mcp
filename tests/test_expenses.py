@@ -698,6 +698,40 @@ async def test_create_partial_outcome_lists_the_expense_that_landed(monkeypatch:
     assert "read back with splitwise_get_expenses" in result
 
 
+async def test_update_partial_outcome_lists_the_expense_and_its_read_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"expenses": [{"id": 77}, {"nope": True}], "errors": {"base": ["nope"]}})
+
+    client = SplitwiseClient(
+        settings=Settings(splitwise_api_key="k" * 20, splitwise_allow_writes=True),
+        transport=httpx.MockTransport(handler),
+    )
+    monkeypatch.setattr("splitwise_mcp.tools.expenses.get_client", lambda: client)
+
+    result = await splitwise_update_expense(UpdateExpenseInput(expense_id=77, description="renamed"))
+
+    assert result.startswith("Error: Splitwise rejected the request to /update_expense/77: nope")
+    assert "still returned 2 expense object(s) (id 77, unknown)" in result
+    assert "read back with splitwise_get_expense (expense_id=77)" in result
+
+
+async def test_create_garbled_partial_body_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"expenses": True, "errors": {"base": ["odd"]}})
+
+    client = SplitwiseClient(
+        settings=Settings(splitwise_api_key="k" * 20, splitwise_allow_writes=True),
+        transport=httpx.MockTransport(handler),
+    )
+    monkeypatch.setattr("splitwise_mcp.tools.expenses.get_client", lambda: client)
+
+    result = await splitwise_create_expense(
+        CreateExpenseInput(cost="10.00", description="x", equal_split_between=[1, 2], paid_by_user_id=1)
+    )
+
+    assert result == "Error: Splitwise rejected the request to /create_expense: odd"
+
+
 async def test_create_rejected_without_expense_object_has_no_partial_line(monkeypatch: pytest.MonkeyPatch) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"expenses": [], "errors": {"base": ["Invalid group"]}})

@@ -45,8 +45,8 @@ class SplitwiseEnvelopeError(RuntimeError):
     """A 200 response whose body says the write failed (`success: false` / non-empty `errors`).
 
     `body` is the parsed JSON object, because a batch write can be PARTIAL: `/create_friends`
-    answers `{"users": [added…], "errors": {…}}` and `/create_expense` can answer
-    `{"expenses": [...], "errors": {...}}` — a tool renders what did land from it.
+    answers `{"users": [...], "errors": {...}}` and `/create_expense` can answer
+    `{"expenses": [...], "errors": {...}}` — a tool renders what the body still listed.
     """
 
     def __init__(self, errors: Any, *, path: str = "", body: dict[str, Any] | None = None) -> None:

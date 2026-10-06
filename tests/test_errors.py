@@ -40,6 +40,15 @@ def test_400_includes_field_errors_and_a_generic_hint_off_the_expense_paths() ->
     assert "names the offending field" in message
 
 
+@pytest.mark.parametrize("path", ["/get_expenses", "/get_expense/5", "/delete_expense/5", "/create_group"])
+def test_400_on_non_write_expense_paths_gets_the_generic_hint(path: str) -> None:
+    request = httpx.Request("GET", f"https://proxy.example.test/expense-proxy/api/v3.0{path}")
+    response = httpx.Response(400, json={"errors": {"dated_after": ["is invalid"]}}, request=request)
+    message = handle_api_error(httpx.HTTPStatusError("boom", request=request, response=response))
+    assert "sum to the cost" not in message
+    assert "names the offending field" in message
+
+
 @pytest.mark.parametrize("path", ["/create_expense", "/update_expense/51023"])
 def test_400_on_expense_paths_gets_the_money_and_shares_hint(path: str) -> None:
     request = httpx.Request("POST", f"https://secure.splitwise.com/api/v3.0{path}")

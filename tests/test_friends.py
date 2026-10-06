@@ -377,9 +377,28 @@ async def test_create_friends_partial_success_through_real_client_warns(monkeypa
         )
     ]
     assert result.startswith("Error: Splitwise rejected the request to /create_friends: bob@example.com could not")
-    # The partial body travels on the error (SplitwiseEnvelopeError.body): the people Splitwise
-    # DID add are listed, so the LLM never reads this as "nobody was added".
-    assert "- **added by Splitwise despite the errors** (1): Grace" in result
+    # The partial body travels on the error (SplitwiseEnvelopeError.body): the people the
+    # response still listed are named, so the LLM never reads this as "nobody was added".
+    assert (
+        "- **returned by Splitwise in users[] despite the errors** (1): Grace Hopper (id 4821) "
+        "(probably added — confirm with splitwise_get_friends)"
+    ) in result
+    assert result.endswith(PARTIAL_ADD_HINT)
+
+
+async def test_create_friends_garbled_partial_body_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`users` that is not a list must not turn the error path into a crash."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"users": 5, "errors": {"base": ["odd body"]}})
+
+    client = _real_client(handler)
+    monkeypatch.setattr("splitwise_mcp.tools.friends.get_client", lambda: client)
+
+    result = await splitwise_create_friends(CreateFriendsInput.model_validate({"friends": [{"email": "a@b.co"}]}))
+
+    assert result.startswith("Error: Splitwise rejected the request to /create_friends: odd body")
+    assert "returned by Splitwise" not in result
     assert result.endswith(PARTIAL_ADD_HINT)
 
 
@@ -395,7 +414,7 @@ async def test_create_friends_rejected_with_nobody_added_has_no_added_line(monke
     )
 
     assert result.startswith("Error: Splitwise rejected the request to /create_friends: nothing added")
-    assert "added by Splitwise" not in result
+    assert "returned by Splitwise" not in result
     assert result.endswith(PARTIAL_ADD_HINT)
 
 

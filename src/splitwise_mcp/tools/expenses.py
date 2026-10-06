@@ -25,7 +25,7 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field, PositiveInt, ValidationInfo, field_validator, model_validator
 
 from splitwise_mcp.client import SplitwiseEnvelopeError, get_client
-from splitwise_mcp.errors import handle_api_error
+from splitwise_mcp.errors import handle_api_error, redact_credentials
 from splitwise_mcp.formatters import ResponseFormat, clip_response, fmt_money, fmt_person, iso_to_human, to_json
 from splitwise_mcp.server import mcp
 from splitwise_mcp.validators import currency_code, date_iso, money
@@ -555,14 +555,18 @@ def _with_partial_outcome(message: str, exc: Exception, read_back: str) -> str:
     """
     if not isinstance(exc, SplitwiseEnvelopeError):
         return message
-    expenses = [e for e in exc.body.get("expenses") or [] if isinstance(e, dict)]
-    if not expenses:
+    try:  # this IS the error path: nothing here may raise, the base message must always come back
+        raw = exc.body.get("expenses")
+        expenses = [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+        if not expenses:
+            return message
+        ids = ", ".join("unknown" if e.get("id") is None else str(e.get("id")) for e in expenses)
+        return redact_credentials(
+            f"{message}\n- Splitwise still returned {len(expenses)} expense object(s) (id {ids}) alongside the "
+            f"errors — read back with {read_back} before retrying; the change may have landed."
+        )
+    except Exception:  # noqa: BLE001
         return message
-    ids = ", ".join(str(e.get("id")) for e in expenses)
-    return (
-        f"{message}\n- Splitwise still returned {len(expenses)} expense object(s) (id {ids}) alongside the "
-        f"errors — read back with {read_back} before retrying; the change may have landed."
-    )
 
 
 _SAVED_VERBS = {"create": "created", "update": "updated"}
@@ -938,7 +942,9 @@ async def splitwise_create_expense(params: CreateExpenseInput) -> str:
     sum to cost, a share with both or neither identity, duplicate participants, split_equally
     without a group, a payer missing from equal_split_between. Splitwise answers 200 even
     when it rejects an expense — the client turns a non-empty `errors` into
-    `Error: Splitwise rejected the request…`. On a timeout or 5xx the outcome is UNKNOWN:
+    `Error: Splitwise rejected the request…`; if that body still carried an expense object
+    the error adds "Splitwise still returned N expense object(s) … may have landed" with
+    the ids, so read back before retrying. On a timeout or 5xx the outcome is UNKNOWN:
     check `splitwise_get_expenses` before retrying.
     """
     try:
@@ -1033,7 +1039,9 @@ async def splitwise_update_expense(params: UpdateExpenseInput) -> str:
     Error Handling:
     Refused locally (nothing sent) when no field is given, when shares do not add up, or a
     share has both/neither identity. Splitwise answers 200 even on failure — the client turns
-    a non-empty `errors` into `Error: Splitwise rejected the request…`. 404 → wrong id; 403 →
+    a non-empty `errors` into `Error: Splitwise rejected the request…`; if that body still
+    carried an expense object the error adds "Splitwise still returned N expense object(s) …
+    may have landed", so read the expense back before retrying. 404 → wrong id; 403 →
     not your expense.
     """
     try:

@@ -2,8 +2,9 @@
 
 Endpoints (research/02 §C): `GET /get_friends`, `GET /get_friend/{id}`,
 `POST /create_friend`, `POST /create_friends` (⚠ 200 ≠ success), `POST /delete_friend/{id}`
-(⚠ 200 ≠ success). The client raises on a failed envelope; these tools only render the
-happy-path body.
+(⚠ 200 ≠ success). The client raises on a failed envelope; these tools render the
+happy-path body, and `create_friends` additionally lists whatever `users[]` a failed
+batch still carried (the error keeps the parsed body — `SplitwiseEnvelopeError.body`).
 
 Sign convention for every balance rendered here: **positive = the friend owes you**,
 negative = you owe the friend.
@@ -19,7 +20,7 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from splitwise_mcp.client import SplitwiseEnvelopeError, get_client
-from splitwise_mcp.errors import format_errors, handle_api_error
+from splitwise_mcp.errors import format_errors, handle_api_error, redact_credentials
 from splitwise_mcp.formatters import ResponseFormat, clip_response, fmt_money, fmt_person, iso_to_human, to_json
 from splitwise_mcp.server import mcp
 
@@ -476,7 +477,9 @@ async def splitwise_create_friends(params: CreateFriendsInput) -> str:
 
     Returns:
     A confirmation listing every user Splitwise returned (`First Last (id N)`, e-mail,
-    registration status) and the body's `errors` (none on success).
+    registration status) and the body's `errors` (none on success). On a rejected batch
+    the `Error:` is followed by the users Splitwise still listed in `users[]` (probably
+    the ones it added) and a read-back hint.
 
     Examples:
     - params = {"friends": [{"email": "grace@example.com"},
@@ -484,9 +487,9 @@ async def splitwise_create_friends(params: CreateFriendsInput) -> str:
 
     Error Handling:
     Duplicate e-mails in the list are rejected locally before any call. If Splitwise
-    reports any error the call is returned as an `Error:` — some entries may still have
-    been added, so read back with `splitwise_get_friends` before retrying. On a
-    5xx/timeout the outcome is UNKNOWN.
+    reports any error the call is returned as an `Error:` — the people its response still
+    listed are named under it (probably added), so read back with `splitwise_get_friends`
+    before retrying. On a 5xx/timeout the outcome is UNKNOWN.
     """
     try:
         data: dict[str, Any] = {}
@@ -513,15 +516,24 @@ async def splitwise_create_friends(params: CreateFriendsInput) -> str:
     except Exception as exc:
         message = handle_api_error(exc)
         if isinstance(exc, SplitwiseEnvelopeError):
-            # Partial batch: Splitwise lists the people it DID add next to the errors.
-            added = [u for u in exc.body.get("users") or [] if isinstance(u, dict)]
-            if added:
-                names = "; ".join(fmt_person(u) for u in added)
-                message += f"\n- **added by Splitwise despite the errors** ({len(added)}): {names}"
+            # Partial batch: the body can still list users next to the errors. The spec does
+            # not say whether `users[]` holds only the people added (research/02 open item 6),
+            # so the wording stays neutral. Nothing here may raise — this IS the error path.
+            try:
+                raw = exc.body.get("users")
+                listed = [u for u in raw if isinstance(u, dict)] if isinstance(raw, list) else []
+                if listed:
+                    names = "; ".join(fmt_person(u) for u in listed)
+                    message += (
+                        f"\n- **returned by Splitwise in users[] despite the errors** ({len(listed)}): {names} "
+                        "(probably added — confirm with splitwise_get_friends)"
+                    )
+            except Exception:  # noqa: BLE001 — the base message must always come back
+                pass
             message += f"\n{PARTIAL_ADD_HINT}"
         elif isinstance(exc, httpx.HTTPStatusError):
             message += f"\n{PARTIAL_ADD_HINT}"
-        return message
+        return redact_credentials(message)
 
 
 @mcp.tool(

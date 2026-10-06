@@ -12,6 +12,7 @@ quote a request header, i.e. the API key) are described by type only.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import httpx
@@ -33,9 +34,16 @@ _EXPENSE_400_HINT = (
 _GENERIC_400_HINT = "Splitwise names the offending field in the message — check the ids and values you sent."
 
 
+_EXPENSE_WRITE_PATH = re.compile(r"/(create_expense|update_expense/\d+)/?$")
+
+
 def _hint_for_400(path: str) -> str:
-    """The 400 hint depends on the endpoint: the money/shares rules only apply to expenses."""
-    return _EXPENSE_400_HINT if "expense" in path else _GENERIC_400_HINT
+    """The 400 hint depends on the endpoint: the money/shares rules only apply to expense writes.
+
+    Matched on the endpoint segment only, so a `/get_expenses` 400 (a bad date filter) or a
+    base URL that happens to contain "expense" does not get the shares hint.
+    """
+    return _EXPENSE_400_HINT if _EXPENSE_WRITE_PATH.search(path) else _GENERIC_400_HINT
 
 
 def format_errors(errors: Any) -> str:
