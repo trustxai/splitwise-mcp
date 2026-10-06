@@ -211,6 +211,18 @@ async def test_envelope_success_false_raises() -> None:
         await client.request("POST", "/undelete_group/9")
     assert info.value.errors == {"base": ["Group not found"]}
     assert info.value.path == "/undelete_group/9"
+    assert info.value.body == {"success": False, "errors": {"base": ["Group not found"]}}
+
+
+async def test_envelope_error_carries_the_partial_body() -> None:
+    """A partial batch (some users added, some rejected) keeps the whole body on the error."""
+    body = {"users": [{"id": 1, "first_name": "Grace"}], "errors": {"base": ["bob could not be added"]}}
+    client = _client_with(_capturing_handler({}, body=body), splitwise_allow_writes=True)
+    with pytest.raises(SplitwiseEnvelopeError) as info:
+        await client.request("POST", "/create_friends", data={"users": [{"email": "a@b.c"}]})
+    assert info.value.body == body
+    assert info.value.body["users"][0]["first_name"] == "Grace"
+    assert SplitwiseEnvelopeError({"base": ["x"]}).body == {}
 
 
 async def test_envelope_non_empty_errors_raises_even_with_success_missing() -> None:

@@ -512,7 +512,14 @@ async def splitwise_create_friends(params: CreateFriendsInput) -> str:
         return clip_response("\n".join(lines))
     except Exception as exc:
         message = handle_api_error(exc)
-        if isinstance(exc, SplitwiseEnvelopeError | httpx.HTTPStatusError):
+        if isinstance(exc, SplitwiseEnvelopeError):
+            # Partial batch: Splitwise lists the people it DID add next to the errors.
+            added = [u for u in exc.body.get("users") or [] if isinstance(u, dict)]
+            if added:
+                names = "; ".join(fmt_person(u) for u in added)
+                message += f"\n- **added by Splitwise despite the errors** ({len(added)}): {names}"
+            message += f"\n{PARTIAL_ADD_HINT}"
+        elif isinstance(exc, httpx.HTTPStatusError):
             message += f"\n{PARTIAL_ADD_HINT}"
         return message
 

@@ -27,6 +27,16 @@ _KEY_HINT = (
     "page at https://secure.splitwise.com/apps."
 )
 
+_EXPENSE_400_HINT = (
+    "Check that money is a 2-decimal string, ids exist, and that paid shares and owed shares each sum to the cost."
+)
+_GENERIC_400_HINT = "Splitwise names the offending field in the message — check the ids and values you sent."
+
+
+def _hint_for_400(path: str) -> str:
+    """The 400 hint depends on the endpoint: the money/shares rules only apply to expenses."""
+    return _EXPENSE_400_HINT if "expense" in path else _GENERIC_400_HINT
+
 
 def format_errors(errors: Any) -> str:
     """Flatten Splitwise's `errors` payload (`{"base": [...]}` / `{"field": [...]}` / a list) into one line."""
@@ -101,10 +111,7 @@ def _describe(exc: Exception) -> str:
         detail = _detail_from_body(exc.response)
         retry_after = exc.response.headers.get("retry-after")
         if status == 400:
-            return (
-                f"Error (400): Bad request – {detail}. Check that money is a 2-decimal string, ids exist, "
-                "and that paid shares and owed shares each sum to the cost."
-            )
+            return f"Error (400): Bad request – {detail}. {_hint_for_400(exc.request.url.path)}"
         if status == 401:
             return f"Error (401): Unauthorized – {detail}. {_KEY_HINT}"
         if status == 403:

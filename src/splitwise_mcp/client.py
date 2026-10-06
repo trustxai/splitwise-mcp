@@ -42,11 +42,17 @@ FORBIDDEN_FIELDS: dict[str, frozenset[str]] = {
 
 
 class SplitwiseEnvelopeError(RuntimeError):
-    """A 200 response whose body says the write failed (`success: false` / non-empty `errors`)."""
+    """A 200 response whose body says the write failed (`success: false` / non-empty `errors`).
 
-    def __init__(self, errors: Any, *, path: str = "") -> None:
+    `body` is the parsed JSON object, because a batch write can be PARTIAL: `/create_friends`
+    answers `{"users": [added…], "errors": {…}}` and `/create_expense` can answer
+    `{"expenses": [...], "errors": {...}}` — a tool renders what did land from it.
+    """
+
+    def __init__(self, errors: Any, *, path: str = "", body: dict[str, Any] | None = None) -> None:
         self.errors = errors
         self.path = path
+        self.body: dict[str, Any] = body or {}
         detail = format_errors(errors) or "the response reported success=false with no error message"
         super().__init__(f"Splitwise rejected the request{f' to {path}' if path else ''}: {detail}")
 
@@ -206,10 +212,10 @@ class SplitwiseClient:
         if not isinstance(body, dict):
             return
         if body.get("success") is False:
-            raise SplitwiseEnvelopeError(body.get("errors"), path=path)
+            raise SplitwiseEnvelopeError(body.get("errors"), path=path, body=body)
         errors = body.get("errors")
         if errors and format_errors(errors):
-            raise SplitwiseEnvelopeError(errors, path=path)
+            raise SplitwiseEnvelopeError(errors, path=path, body=body)
 
 
 _client: SplitwiseClient | None = None

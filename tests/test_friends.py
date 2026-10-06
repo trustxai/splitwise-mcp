@@ -377,6 +377,25 @@ async def test_create_friends_partial_success_through_real_client_warns(monkeypa
         )
     ]
     assert result.startswith("Error: Splitwise rejected the request to /create_friends: bob@example.com could not")
+    # The partial body travels on the error (SplitwiseEnvelopeError.body): the people Splitwise
+    # DID add are listed, so the LLM never reads this as "nobody was added".
+    assert "- **added by Splitwise despite the errors** (1): Grace" in result
+    assert result.endswith(PARTIAL_ADD_HINT)
+
+
+async def test_create_friends_rejected_with_nobody_added_has_no_added_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"users": [], "errors": {"base": ["nothing added"]}})
+
+    client = _real_client(handler)
+    monkeypatch.setattr("splitwise_mcp.tools.friends.get_client", lambda: client)
+
+    result = await splitwise_create_friends(
+        CreateFriendsInput.model_validate({"friends": [{"email": "bob@example.com"}]})
+    )
+
+    assert result.startswith("Error: Splitwise rejected the request to /create_friends: nothing added")
+    assert "added by Splitwise" not in result
     assert result.endswith(PARTIAL_ADD_HINT)
 
 

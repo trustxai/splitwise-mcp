@@ -33,10 +33,21 @@ def test_format_errors_shapes() -> None:
     assert format_errors("plain") == "plain"
 
 
-def test_400_includes_field_errors_and_hint() -> None:
-    message = handle_api_error(_status_error(400, {"errors": {"cost": ["must be a number"]}}))
+def test_400_includes_field_errors_and_a_generic_hint_off_the_expense_paths() -> None:
+    message = handle_api_error(_status_error(400, {"errors": {"user_email": ["is invalid"]}}))
+    assert message.startswith("Error (400): Bad request – user_email: is invalid.")
+    assert "sum to the cost" not in message
+    assert "names the offending field" in message
+
+
+@pytest.mark.parametrize("path", ["/create_expense", "/update_expense/51023"])
+def test_400_on_expense_paths_gets_the_money_and_shares_hint(path: str) -> None:
+    request = httpx.Request("POST", f"https://secure.splitwise.com/api/v3.0{path}")
+    response = httpx.Response(400, json={"errors": {"cost": ["must be a number"]}}, request=request)
+    message = handle_api_error(httpx.HTTPStatusError("boom", request=request, response=response))
     assert message.startswith("Error (400): Bad request – cost: must be a number.")
     assert "sum to the cost" in message
+    assert "names the offending field" not in message
 
 
 def test_401_points_at_the_apps_page() -> None:

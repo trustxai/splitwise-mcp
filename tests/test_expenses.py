@@ -674,6 +674,47 @@ async def test_create_non_json_200_reports_unknown_outcome(monkeypatch: pytest.M
     assert [call[:2] for call in fake.calls] == [("POST", "/create_expense")]
 
 
+async def test_create_partial_outcome_lists_the_expense_that_landed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 200 carrying BOTH an expense object and errors must not read as 'nothing was created'."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"expenses": [{"id": 9001, "description": "x", "cost": "10.00"}], "errors": {"base": ["partial"]}},
+        )
+
+    client = SplitwiseClient(
+        settings=Settings(splitwise_api_key="k" * 20, splitwise_allow_writes=True),
+        transport=httpx.MockTransport(handler),
+    )
+    monkeypatch.setattr("splitwise_mcp.tools.expenses.get_client", lambda: client)
+
+    result = await splitwise_create_expense(
+        CreateExpenseInput(cost="10.00", description="x", equal_split_between=[1, 2], paid_by_user_id=1)
+    )
+
+    assert result.startswith("Error: Splitwise rejected the request to /create_expense: partial")
+    assert "still returned 1 expense object(s) (id 9001)" in result
+    assert "read back with splitwise_get_expenses" in result
+
+
+async def test_create_rejected_without_expense_object_has_no_partial_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"expenses": [], "errors": {"base": ["Invalid group"]}})
+
+    client = SplitwiseClient(
+        settings=Settings(splitwise_api_key="k" * 20, splitwise_allow_writes=True),
+        transport=httpx.MockTransport(handler),
+    )
+    monkeypatch.setattr("splitwise_mcp.tools.expenses.get_client", lambda: client)
+
+    result = await splitwise_create_expense(
+        CreateExpenseInput(cost="10.00", description="x", equal_split_between=[1, 2], paid_by_user_id=1)
+    )
+
+    assert result == "Error: Splitwise rejected the request to /create_expense: Invalid group"
+
+
 async def test_create_is_refused_by_the_client_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
     """The tool does not gate — the real client does, before any byte leaves the process."""
     sent: list[httpx.Request] = []

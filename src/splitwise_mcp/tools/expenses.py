@@ -24,7 +24,7 @@ from typing import Any, Literal, Self
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field, PositiveInt, ValidationInfo, field_validator, model_validator
 
-from splitwise_mcp.client import get_client
+from splitwise_mcp.client import SplitwiseEnvelopeError, get_client
 from splitwise_mcp.errors import handle_api_error
 from splitwise_mcp.formatters import ResponseFormat, clip_response, fmt_money, fmt_person, iso_to_human, to_json
 from splitwise_mcp.server import mcp
@@ -546,6 +546,25 @@ def _unknown_outcome(read_back: str) -> str:
     )
 
 
+def _with_partial_outcome(message: str, exc: Exception, read_back: str) -> str:
+    """Append what Splitwise still returned when a 200 carried errors (a partial outcome).
+
+    The client raises `SplitwiseEnvelopeError` on a non-empty `errors`, but the same body
+    can carry `expenses: [...]` — an expense that DID land. Saying only "rejected" would
+    make the LLM retry and duplicate it.
+    """
+    if not isinstance(exc, SplitwiseEnvelopeError):
+        return message
+    expenses = [e for e in exc.body.get("expenses") or [] if isinstance(e, dict)]
+    if not expenses:
+        return message
+    ids = ", ".join(str(e.get("id")) for e in expenses)
+    return (
+        f"{message}\n- Splitwise still returned {len(expenses)} expense object(s) (id {ids}) alongside the "
+        f"errors — read back with {read_back} before retrying; the change may have landed."
+    )
+
+
 _SAVED_VERBS = {"create": "created", "update": "updated"}
 _SAVED_READ_BACK = {"create": "splitwise_get_expenses", "update": "splitwise_get_expense"}
 
@@ -957,7 +976,7 @@ async def splitwise_create_expense(params: CreateExpenseInput) -> str:
             return _unknown_outcome("splitwise_get_expenses")
         return clip_response(_render_saved("create", saved))
     except Exception as exc:
-        return handle_api_error(exc)
+        return _with_partial_outcome(handle_api_error(exc), exc, "splitwise_get_expenses")
 
 
 @mcp.tool(
@@ -1042,7 +1061,9 @@ async def splitwise_update_expense(params: UpdateExpenseInput) -> str:
             return _unknown_outcome(f"splitwise_get_expense (expense_id={params.expense_id})")
         return clip_response(_render_saved("update", saved))
     except Exception as exc:
-        return handle_api_error(exc)
+        return _with_partial_outcome(
+            handle_api_error(exc), exc, f"splitwise_get_expense (expense_id={params.expense_id})"
+        )
 
 
 @mcp.tool(
