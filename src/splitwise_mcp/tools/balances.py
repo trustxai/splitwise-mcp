@@ -84,8 +84,8 @@ class GetGroupBalancesInput(BaseModel):
         ...,
         ge=0,
         description="The group id (from `splitwise_get_groups` / `splitwise_resolve_group`). "
-        "0 = the non-group-expenses pseudo-group (unverified on /get_group/0 until the live smoke; "
-        "on a 404 use `splitwise_get_balances`).",
+        "0 = the non-group-expenses pseudo-group (`/get_group/0` answers; its only member is you, so "
+        "for balances with friends use `splitwise_get_balances`).",
     )
     response_format: ResponseFormat = Field(
         default=ResponseFormat.MARKDOWN,
@@ -394,9 +394,9 @@ async def splitwise_get_group_balances(params: GetGroupBalancesInput) -> str:
 
     When NOT to Use:
     - For your balances across all friends (use `splitwise_get_balances`).
-    - For non-group expenses: group_id 0 is the non-group pseudo-group in `get_groups`, but
-      whether `/get_group/0` answers is unverified until the live smoke — on a 404, use
-      `splitwise_get_balances`.
+    - For non-group expenses: group_id 0 is the non-group pseudo-group; `/get_group/0`
+      answers but lists only you as a member, so per-friend balances come from
+      `splitwise_get_balances`, not from here.
     - For the group's details, invite link or membership changes (use `splitwise_get_group`,
       `splitwise_add_user_to_group`, `splitwise_remove_user_from_group`).
     - To find a group id from its name (use `splitwise_resolve_group` / `splitwise_get_groups`).

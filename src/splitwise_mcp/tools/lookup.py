@@ -349,6 +349,9 @@ async def splitwise_get_categories(params: GetCategoriesInput) -> str:
     static); `refresh: true` refetches. **Expenses must use a subcategory id** as
     `category_id` — a parent id is not accepted. When nothing fits, use the "Other"
     subcategory under the closest parent (or "General" under "Uncategorized").
+    **Names come back in the account's locale** (a Spanish account sees "Supermercado",
+    "Taxi", "Avión" — not the English names from Splitwise's docs); the ids are the same
+    everywhere.
 
     When to Use:
     - To browse the categories before creating or recategorising an expense.
@@ -785,6 +788,10 @@ async def splitwise_resolve_category(params: ResolveCategoryInput) -> str:
     must match. The closest parent categories follow, flagged "parent — not usable for
     expenses", with their subcategories so you can pick one; a parent scores the better of
     its own name and its best subcategory (so "groceries" surfaces "Food and drink").
+
+    The names scored are the ones Splitwise returns for **this account's locale**: on a
+    Spanish account "groceries" finds nothing but "supermercado" resolves. Query in the
+    language the user sees in their Splitwise app, or browse `splitwise_get_categories`.
 
     When to Use:
     - Before `splitwise_create_expense` / `splitwise_update_expense`, when the user named

@@ -10,6 +10,7 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
+from splitwise_mcp.formatters import ResponseFormat
 from splitwise_mcp.server import mcp
 from splitwise_mcp.tools import lookup
 from splitwise_mcp.tools.lookup import (
@@ -900,6 +901,15 @@ async def test_get_currencies_live_smoke() -> None:
 
 @pytest.mark.live
 async def test_resolve_category_live_smoke() -> None:
-    result = await splitwise_resolve_category(ResolveCategoryInput(query="Groceries"))
+    """Category names come back in the ACCOUNT'S LOCALE (a Spanish account gets "Supermercado",
+    not "Groceries" — measured 2026-10-05), so the smoke resolves a name taken from the live
+    list itself instead of assuming English."""
+    listing = await splitwise_get_categories(GetCategoriesInput(response_format=ResponseFormat.JSON))
+    payload = json.loads(listing)
+    parents = payload.get("categories") if isinstance(payload, dict) else payload
+    first_sub = next(sub for parent in parents for sub in parent.get("subcategories") or [])
 
-    assert "**Resolved**: Groceries (id" in result
+    result = await splitwise_resolve_category(ResolveCategoryInput(query=first_sub["name"]))
+
+    assert "**Resolved**" in result, result[:300]
+    assert f"(id {first_sub['id']})" in result

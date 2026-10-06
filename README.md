@@ -349,7 +349,11 @@ ever written to stdout.
   `SPLITWISE_MCP_ALLOWED_ORIGINS`. **404 behind a proxy** — the proxy strips the path
   prefix; point it at `http://127.0.0.1:8765/mcp`, not at the bare port.
 - **Balances look inverted** — the sign convention is stated in every balance tool's
-  output: positive = owed **to you**.
+  output: positive = owed **to you** (verified against real expenses).
+- **`splitwise_resolve_category` finds nothing for "groceries"** — category names come
+  back in your account's locale (a Spanish account has "Supermercado"). Ask in the
+  language you see in the Splitwise app, or browse `splitwise_get_categories`; the ids
+  are the same in every language.
 
 ## Contributing
 
