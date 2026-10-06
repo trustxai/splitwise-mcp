@@ -18,6 +18,7 @@ def test_defaults() -> None:
     assert settings.splitwise_mcp_port == 8765
     assert settings.splitwise_mcp_path == "/mcp"
     assert settings.splitwise_mcp_allowed_hosts == ""
+    assert settings.splitwise_mcp_allowed_origins == ""
     assert settings.splitwise_mcp_stateless is True
     assert settings.has_api_key is False
     assert settings.base_url == DEFAULT_API_URL
@@ -77,6 +78,14 @@ def test_allowed_hosts_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
         "SPLITWISE_MCP_ALLOWED_HOSTS", " ax42.tail8f6c35.ts.net, 127.0.0.1:8765 ,,localhost:8765, 127.0.0.1:8765 "
     )
     assert Settings().allowed_hosts == ["ax42.tail8f6c35.ts.net", "127.0.0.1:8765", "localhost:8765"]
+
+
+def test_allowed_origins_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert Settings().allowed_origins == []
+    monkeypatch.setenv("SPLITWISE_MCP_ALLOWED_ORIGINS", " https://grok.com ,https://grok.com, ,https://x.ai ")
+    settings = Settings()
+    assert settings.splitwise_mcp_allowed_origins == "https://grok.com ,https://grok.com, ,https://x.ai"
+    assert settings.allowed_origins == ["https://grok.com", "https://x.ai"]
 
 
 @pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1"])
