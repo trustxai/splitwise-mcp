@@ -509,12 +509,15 @@ async def test_group_balances_flags_unparsed_amounts(monkeypatch: pytest.MonkeyP
     assert "- Bob (id 2) → Ada Lovelace (id 1) Infinity USD (unparsed)" in result
 
 
-def test_group_id_zero_is_documented_as_unverified() -> None:
+def test_group_id_zero_is_documented_as_the_pseudo_group() -> None:
+    # Measured 2026-10-05: GET /get_group/0 answers 200 with one member (you), so the
+    # docs point friend balances at splitwise_get_balances instead of warning "unverified".
     doc = " ".join((splitwise_get_group_balances.__doc__ or "").split())
-    assert "whether `/get_group/0` answers is unverified until the live smoke" in doc
-    assert "on a 404, use `splitwise_get_balances`" in doc
+    assert "`/get_group/0` answers but lists only you as a member" in doc
+    assert "`splitwise_get_balances`" in doc
     field_doc = GetGroupBalancesInput.model_fields["group_id"].description or ""
-    assert "unverified on /get_group/0 until the live smoke" in field_doc
+    assert "`/get_group/0` answers; its only member is you" in field_doc
+    assert "unverified" not in field_doc
 
 
 # -- live smoke (read-only; skipped without SPLITWISE_API_KEY) ---------------------
