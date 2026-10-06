@@ -8,6 +8,7 @@ under any configuration — this module's input model does not even have those f
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from mcp.types import ToolAnnotations
@@ -26,7 +27,9 @@ MAX_DISPLAY_ROWS = 50
 # The profile fields `splitwise_update_user` may change, in rendering order.
 UPDATABLE_FIELDS = ("first_name", "last_name", "locale", "default_currency")
 
-_LOCALE_PATTERN = r"^[A-Za-z]{2,3}(?:[-_][A-Za-z0-9]{2,8})*$"
+# Format check only (language code + optional region/script subtags); Splitwise decides
+# whether a well-formed code is actually supported.
+_LOCALE_RE = re.compile(r"^[A-Za-z]{2,3}(?:[-_][A-Za-z0-9]{2,8})*$")
 
 
 # -- input models ------------------------------------------------------------
@@ -73,8 +76,10 @@ class UpdateUserInput(BaseModel):
     )
     locale: str | None = Field(
         default=None,
-        pattern=_LOCALE_PATTERN,
-        description="New interface locale code such as 'en', 'es' or 'pt-BR'. Omit to leave unchanged.",
+        description=(
+            "New interface locale code such as 'en', 'es' or 'pt-BR' (format-checked only; Splitwise decides "
+            "whether it is supported). Omit to leave unchanged."
+        ),
     )
     default_currency: str | None = Field(
         default=None,
@@ -87,6 +92,16 @@ class UpdateUserInput(BaseModel):
         if value is None:
             return None
         return currency_code(value, field="default_currency")
+
+    @field_validator("locale", mode="before")
+    @classmethod
+    def _check_locale(cls, value: object) -> object:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not _LOCALE_RE.match(text):
+            raise ValueError(f"locale must be a language code like 'en', 'es' or 'pt-BR' (got {value!s})")
+        return text
 
     @model_validator(mode="after")
     def _require_one_change(self) -> UpdateUserInput:
@@ -296,7 +311,11 @@ async def splitwise_update_user(params: UpdateUserInput) -> str:
 
     Returns:
     A confirmation naming the user Splitwise returned and, for each field you sent, the
-    value as it appears in the response (flagged when the response does not match).
+    value as it appears in the response. It is headed "Profile updated" only when every
+    sent field comes back with exactly the value sent. Otherwise it is headed "Update
+    accepted by Splitwise — N of M field(s) not confirmed" with those fields flagged, and
+    tells you to read the profile back with `splitwise_get_current_user`. This is common
+    for `locale`/`default_currency`, which the flat user object in the response may omit.
 
     Examples:
     - `params = {"user_id": 491923, "default_currency": "PEN"}`
@@ -305,6 +324,8 @@ async def splitwise_update_user(params: UpdateUserInput) -> str:
     Error Handling:
     Validation rejects a call with no field to change, an unknown field (including
     `email`/`password`) or a currency that is not a 3-letter code, before any request.
+    locale is checked for format only and passed through; Splitwise decides whether it
+    is supported (a value it ignores shows as 'differs' in the confirmation).
     403 when `user_id` is not your own id; 400 with Splitwise's field messages for a value
     it rejects. A timeout or 5xx leaves the outcome UNKNOWN — read the profile back with
     `splitwise_get_current_user` before retrying.
@@ -319,18 +340,31 @@ async def splitwise_update_user(params: UpdateUserInput) -> str:
                 f"Splitwise accepted POST /update_user/{params.user_id} but returned no user object; "
                 "read the profile back with splitwise_get_current_user to confirm the change."
             )
-        lines = [
-            f"# Profile updated: {fmt_person(user)}",
-            "",
-            "Fields sent, as Splitwise returned them:",
-        ]
+        rows: list[str] = []
+        unconfirmed: list[str] = []
         for name, sent in changes.items():
             if name not in user:
-                lines.append(f"- **{name}**: sent `{sent}` — not present in the response")
+                unconfirmed.append(name)
+                rows.append(f"- **{name}**: sent `{sent}` — not present in the response")
                 continue
             returned = user.get(name)
-            flag = "" if str(returned) == sent else f" (sent `{sent}` — the response differs)"
-            lines.append(f"- **{name}**: `{returned}`{flag}")
+            if isinstance(returned, str) and returned == sent:
+                rows.append(f"- **{name}**: `{returned}`")
+                continue
+            unconfirmed.append(name)
+            shown = "empty in the response" if returned is None else f"`{returned}`"
+            rows.append(f"- **{name}**: {shown} (sent `{sent}` — the response differs)")
+        if unconfirmed:
+            lines = [
+                f"# Update accepted by Splitwise — {len(unconfirmed)} of {len(changes)} field(s) not confirmed: "
+                + ", ".join(unconfirmed),
+                "",
+                f"- **user returned**: {fmt_person(user)}",
+                "- Read the profile back with `splitwise_get_current_user` to see the values Splitwise kept.",
+            ]
+        else:
+            lines = [f"# Profile updated: {fmt_person(user)}"]
+        lines.extend(["", "Fields sent, as Splitwise returned them:", *rows])
         return clip_response("\n".join(lines))
     except Exception as exc:
         return handle_api_error(exc)

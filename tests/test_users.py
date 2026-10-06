@@ -123,6 +123,7 @@ async def test_get_current_user_missing_fields_render_na(monkeypatch: pytest.Mon
     assert "default currency**: N/A" in result
     assert "notifications last read**: N/A" in result
     assert "notification settings**: N/A" in result
+    assert fake.calls == [("GET", "/get_current_user", {})]
 
 
 async def test_get_current_user_without_user_object(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -132,6 +133,7 @@ async def test_get_current_user_without_user_object(monkeypatch: pytest.MonkeyPa
     result = await splitwise_get_current_user(GetCurrentUserInput())
 
     assert result == "Error: Splitwise returned no user object for GET /get_current_user."
+    assert fake.calls == [("GET", "/get_current_user", {})]
 
 
 async def test_get_current_user_unauthorized(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -144,6 +146,7 @@ async def test_get_current_user_unauthorized(monkeypatch: pytest.MonkeyPatch) ->
 
     assert result.startswith("Error (401)")
     assert "secure.splitwise.com/apps" in result
+    assert fake.calls == [("GET", "/get_current_user", {})]
 
 
 # -- splitwise_get_user -----------------------------------------------------
@@ -168,6 +171,7 @@ async def test_get_user_json(monkeypatch: pytest.MonkeyPatch) -> None:
     result = await splitwise_get_user(GetUserInput(user_id=77, response_format=ResponseFormat.JSON))
 
     assert json.loads(result) == OTHER_USER
+    assert fake.calls == [("GET", "/get_user/77", {})]
 
 
 async def test_get_user_forbidden_for_unconnected_user(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -189,6 +193,7 @@ async def test_get_user_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
     result = await splitwise_get_user(GetUserInput(user_id=999999))
 
     assert result.startswith("Error (404)")
+    assert fake.calls == [("GET", "/get_user/999999", {})]
 
 
 def test_get_user_rejects_non_positive_id() -> None:
@@ -232,10 +237,44 @@ async def test_update_user_flat_response_and_mismatch_flag(monkeypatch: pytest.M
     assert fake.calls == [
         ("POST", "/update_user/491923", {"data": {"last_name": "Byron", "locale": "es", "default_currency": "EUR"}})
     ]
-    assert "# Profile updated: Ada Lovelace (id 491923)" in result
+    assert result.startswith(
+        "# Update accepted by Splitwise — 3 of 3 field(s) not confirmed: last_name, locale, default_currency\n"
+    )
+    assert "Profile updated" not in result
+    assert "- **user returned**: Ada Lovelace (id 491923)" in result
+    assert "Read the profile back with `splitwise_get_current_user`" in result
     assert "- **last_name**: `Lovelace` (sent `Byron` — the response differs)" in result
     assert "- **locale**: `en` (sent `es` — the response differs)" in result
     assert "- **default_currency**: sent `EUR` — not present in the response" in result
+
+
+async def test_update_user_locale_only_against_inventory_flat_body_is_not_confirmed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Inventory A3's flat user object has no `locale` key: the update must not claim success.
+    flat = {"id": 491923, "first_name": "Ada", "last_name": "Lovelace", "email": "ada@example.com"}
+    fake = _FakeClient(routes={"/update_user/491923": flat})
+    _install(monkeypatch, fake)
+
+    result = await splitwise_update_user(UpdateUserInput(user_id=491923, locale="es"))
+
+    assert fake.calls == [("POST", "/update_user/491923", {"data": {"locale": "es"}})]
+    assert result.startswith("# Update accepted by Splitwise — 1 of 1 field(s) not confirmed: locale\n")
+    assert "- **locale**: sent `es` — not present in the response" in result
+
+
+async def test_update_user_null_in_response_is_not_confirmed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A returned null must not compare equal to the literal string "None".
+    body = {"user": {"id": 491923, "first_name": None, "last_name": "Lovelace"}}
+    fake = _FakeClient(routes={"/update_user/491923": body})
+    _install(monkeypatch, fake)
+
+    result = await splitwise_update_user(UpdateUserInput(user_id=491923, first_name="None", last_name="Lovelace"))
+
+    assert fake.calls == [("POST", "/update_user/491923", {"data": {"first_name": "None", "last_name": "Lovelace"}})]
+    assert result.startswith("# Update accepted by Splitwise — 1 of 2 field(s) not confirmed: first_name\n")
+    assert "- **first_name**: empty in the response (sent `None` — the response differs)" in result
+    assert result.endswith("- **last_name**: `Lovelace`")
 
 
 async def test_update_user_without_user_in_response(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -246,6 +285,7 @@ async def test_update_user_without_user_in_response(monkeypatch: pytest.MonkeyPa
 
     assert "returned no user object" in result
     assert "splitwise_get_current_user" in result
+    assert fake.calls == [("POST", "/update_user/491923", {"data": {"locale": "en"}})]
 
 
 async def test_update_user_forbidden_for_another_users_id(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -292,8 +332,15 @@ def test_update_user_rejects_bad_currency(bad: str) -> None:
 
 @pytest.mark.parametrize("bad", ["e", "english!", "en US"])
 def test_update_user_rejects_bad_locale(bad: str) -> None:
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError, match=r"locale must be a language code like 'en', 'es' or 'pt-BR' \(got "):
         UpdateUserInput(user_id=491923, locale=bad)
+
+
+def test_update_user_locale_is_format_checked_only_and_stripped() -> None:
+    # Well-formed but unknown codes pass through: Splitwise decides whether they are supported.
+    assert UpdateUserInput(user_id=491923, locale="zz-QQ").locale == "zz-QQ"
+    assert UpdateUserInput(user_id=491923, locale=" pt-BR ").locale == "pt-BR"
+    assert UpdateUserInput(user_id=491923, locale="pt_BR").changes() == {"locale": "pt_BR"}
 
 
 def test_update_user_rejects_blank_name() -> None:
