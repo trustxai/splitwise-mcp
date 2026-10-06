@@ -4,7 +4,8 @@ Inventory B1–B7 (research/02). Reads render members as `First Last (id N)` and
 as `+12.50 USD`; group id 0 is Splitwise's pseudo-group for non-group expenses. Every
 write is gated by the client's kill-switch (SPLITWISE_ALLOW_WRITES) and its envelope
 check (Splitwise answers 200 OK for failed writes); the tools render the happy path from
-the body and never claim more than it says.
+the body and never claim more than it says — a write is only reported as done when the
+body says `success: true`.
 """
 
 from __future__ import annotations
@@ -28,8 +29,10 @@ from splitwise_mcp.formatters import (
 )
 from splitwise_mcp.server import mcp
 
-# Context-window guard on top of the API (get_groups has no limit/offset).
+# Context-window guard on top of the API (`/get_groups` has no limit/offset: the tool pages client-side).
 MAX_DISPLAY_ROWS = 50
+# Members listed per balance cell in `splitwise_get_groups` when `current_user_id` is absent.
+MAX_BALANCE_CELL_ENTRIES = 6
 
 NON_GROUP_ID = 0
 NON_GROUP_NOTE = (
@@ -68,7 +71,14 @@ class GetGroupsInput(BaseModel):
         ge=1,
         description=(
             "Your own Splitwise user id (from `splitwise_health_check`). When given, the balance column shows "
-            "only YOUR balance in each group; when omitted, every member's non-zero balance is listed."
+            "only YOUR balance in each group; when omitted, members' non-zero balances are listed."
+        ),
+    )
+    offset: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            f"Skip this many groups (the tool shows {MAX_DISPLAY_ROWS} per call; use the 'next offset' it reports)."
         ),
     )
     response_format: ResponseFormat = Field(
@@ -211,6 +221,11 @@ class RemoveUserFromGroupInput(BaseModel):
 # -- rendering helpers ---------------------------------------------------------
 
 
+def _cell(text: Any) -> str:
+    """Make a value safe inside a markdown table cell (a `|` in a name would shift the columns)."""
+    return str(text).replace("|", "\\|")
+
+
 def _is_nonzero(amount: Any) -> bool:
     try:
         return Decimal(str(amount)) != 0
@@ -245,28 +260,58 @@ def _groups_balance_cell(group: dict[str, Any], current_user_id: int | None) -> 
             return "you are not listed"
         return _balance_text(me)
     owing = [f"{fmt_person(m)} {', '.join(_balances(m))}" for m in members if _balances(m)]
-    return "; ".join(owing) if owing else "everyone settled up"
+    if not owing:
+        return "everyone settled up"
+    cell = "; ".join(owing[:MAX_BALANCE_CELL_ENTRIES])
+    if len(owing) > MAX_BALANCE_CELL_ENTRIES:
+        cell += f"; … {len(owing) - MAX_BALANCE_CELL_ENTRIES} more (see `splitwise_get_group`)"
+    return cell
 
 
-def _debt_lines(debts: list[dict[str, Any]], names: dict[Any, str]) -> list[str]:
-    lines = []
-    for debt in debts:
+def _debt_section(title: str, debts: list[dict[str, Any]], names: dict[Any, str]) -> list[str]:
+    """A `## title` block with one `A → B 12.50 USD` line per debt (A owes B), capped at MAX_DISPLAY_ROWS."""
+    lines = ["", f"## {title}", ""]
+    for debt in debts[:MAX_DISPLAY_ROWS]:
         frm, to = debt.get("from"), debt.get("to")
         lines.append(
             f"- {names.get(frm, fmt_person(None, fallback_id=frm))} → {names.get(to, fmt_person(None, fallback_id=to))}"
             f" {fmt_money(debt.get('amount'), debt.get('currency_code') or '', signed=False)}"
         )
+    if len(debts) > MAX_DISPLAY_ROWS:
+        lines.append(f"_Showing the first {MAX_DISPLAY_ROWS} of {len(debts)} debts — response_format=json has all._")
     return lines
+
+
+def _body(resp: Any) -> dict[str, Any]:
+    """The response body as a dict ({} when it is empty, not JSON, or not an object)."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return {}
+    return body if isinstance(body, dict) else {}
 
 
 def _success_text(body: dict[str, Any]) -> str:
     """Render the `success` / `errors` outcome exactly as the body reported it."""
     success = body.get("success")
-    text = f"success: {str(success).lower()}" if isinstance(success, bool) else "success: not reported"
+    if success is None:
+        text = "success: not reported"
+    elif isinstance(success, bool):
+        text = f"success: {str(success).lower()}"
+    else:
+        text = f"success: {success!r}"
     if "errors" in body:
         detail = format_errors(body.get("errors"))
         text += f"; errors: {detail}" if detail else "; errors: none"
     return text
+
+
+def _unconfirmed(path: str, body: dict[str, Any], *, verify: str, outcome: str, extra: str = "") -> str:
+    """The reply for a 2xx write whose body does not say `success: true` — never claim the action happened."""
+    return (
+        f"Splitwise answered HTTP 200 to POST {path} without confirming success ({_success_text(body)}{extra}) — "
+        f"verify with {verify} before telling the user {outcome}."
+    )
 
 
 # -- read tools ----------------------------------------------------------------
@@ -287,8 +332,9 @@ async def splitwise_get_groups(params: GetGroupsInput) -> str:
 
     Calls `GET /get_groups` and renders one row per group: name, id, type, number of
     members and the balance column. With `current_user_id` the column is YOUR balance in
-    that group; without it, every member's non-zero balance is listed compactly.
-    Group id 0 is Splitwise's pseudo-group for non-group expenses.
+    that group; without it, members' non-zero balances are listed compactly (at most 6 per
+    group — `splitwise_get_group` has the rest). Group id 0 is Splitwise's pseudo-group for
+    non-group expenses.
     Sign convention: positive = owed to that member (with current_user_id: owed to you);
     negative = they (you) owe.
 
@@ -302,13 +348,17 @@ async def splitwise_get_groups(params: GetGroupsInput) -> str:
     - For balances per friend across all groups (use `splitwise_get_balances` / `splitwise_get_friends`).
 
     Returns:
-    A markdown table (at most 50 rows; the rest is counted) or, with response_format=json,
-    `{"count", "shown", "groups": [raw group objects]}`.
+    A markdown table or, with response_format=json,
+    `{"count", "offset", "shown", "has_more", "next_offset", "groups": [raw group objects]}`.
+
+    Pagination:
+    Splitwise returns every group at once; the tool shows 50 per call. When more remain it
+    reports the next offset — call again with `offset` set to it.
 
     Examples:
     - params = {}
     - params = {"current_user_id": 491923}
-    - params = {"response_format": "json"}
+    - params = {"offset": 50, "response_format": "json"}
 
     Error Handling:
     401 → the API key is missing or was regenerated; network errors are reported as `Error: ...`.
@@ -317,35 +367,54 @@ async def splitwise_get_groups(params: GetGroupsInput) -> str:
         client = get_client()
         resp = await client.request("GET", "/get_groups")
         groups: list[dict[str, Any]] = resp.json().get("groups") or []
-        shown = groups[:MAX_DISPLAY_ROWS]
+        total = len(groups)
+        page = groups[params.offset : params.offset + MAX_DISPLAY_ROWS]
+        next_offset = params.offset + len(page)
+        has_more = next_offset < total
 
         if params.response_format is ResponseFormat.JSON:
-            return clip_response(to_json({"count": len(groups), "shown": len(shown), "groups": shown}))
+            return clip_response(
+                to_json(
+                    {
+                        "count": total,
+                        "offset": params.offset,
+                        "shown": len(page),
+                        "has_more": has_more,
+                        "next_offset": next_offset if has_more else None,
+                        "groups": page,
+                    }
+                )
+            )
 
-        lines = [f"# Splitwise groups ({len(groups)})", ""]
+        lines = [f"# Splitwise groups ({total})", ""]
         if not groups:
             lines.append("_You are not in any group._")
             return "\n".join(lines)
+        if not page:
+            lines.append(f"_No groups at offset {params.offset} — there are {total}; use an offset below {total}._")
+            return "\n".join(lines)
         balance_header = "Your balance" if params.current_user_id is not None else "Members' balances"
-        lines.extend(
-            [
-                f"| Group | Type | Members | {balance_header} |",
-                "|---|---|---|---|",
-            ]
-        )
-        for group in shown:
+        lines.extend([f"| Group | Type | Members | {balance_header} |", "|---|---|---|---|"])
+        for group in page:
             label = _group_label(group)
             if group.get("id") == NON_GROUP_ID:
                 label += " — non-group expenses"
             lines.append(
-                f"| {label} | {group.get('group_type') or 'N/A'} | {len(group.get('members') or [])} | "
-                f"{_groups_balance_cell(group, params.current_user_id)} |"
+                f"| {_cell(label)} | {_cell(group.get('group_type') or 'N/A')} | {len(group.get('members') or [])} | "
+                f"{_cell(_groups_balance_cell(group, params.current_user_id))} |"
             )
-        if len(groups) > len(shown):
-            lines.append("")
-            lines.append(f"_Showing the first {len(shown)} of {len(groups)} groups._")
-        lines.extend(["", SIGN_NOTE])
-        if any(g.get("id") == NON_GROUP_ID for g in shown):
+        lines.append("")
+        if params.offset or has_more:
+            lines.append(f"_Showing groups {params.offset + 1}–{next_offset} of {total}._")
+        if has_more:
+            lines.append(
+                f"More available — next offset → **{next_offset}**. "
+                "To find one group by name, use `splitwise_resolve_group`."
+            )
+        lines.append(SIGN_NOTE)
+        if params.current_user_id is None:
+            lines.append("Pass `current_user_id` (your id, from `splitwise_health_check`) to show only your balance.")
+        if any(g.get("id") == NON_GROUP_ID for g in page):
             lines.append(NON_GROUP_NOTE)
         return clip_response("\n".join(lines))
     except Exception as exc:
@@ -382,8 +451,8 @@ async def splitwise_get_group(params: GetGroupInput) -> str:
     - For the group's expenses (use `splitwise_get_expenses` with group_id).
 
     Returns:
-    A markdown block (name, type, settings, members, debts, invite link) or, with
-    response_format=json, the raw group object.
+    A markdown block (name, type, settings, members, debts, invite link; members and debts
+    capped at 50 each, with a note) or, with response_format=json, the raw group object.
 
     Examples:
     - params = {"group_id": 12345}
@@ -417,9 +486,11 @@ async def splitwise_get_group(params: GetGroupInput) -> str:
         lines.extend(["", f"## Members ({len(members)})", ""])
         if members:
             lines.extend(["| Member | Balance |", "|---|---|"])
-            lines.extend(f"| {fmt_person(m)} | {_balance_text(m)} |" for m in members[:MAX_DISPLAY_ROWS])
+            lines.extend(f"| {_cell(fmt_person(m))} | {_cell(_balance_text(m))} |" for m in members[:MAX_DISPLAY_ROWS])
             if len(members) > MAX_DISPLAY_ROWS:
-                lines.append(f"\n_Showing the first {MAX_DISPLAY_ROWS} of {len(members)} members._")
+                lines.append(
+                    f"\n_Showing the first {MAX_DISPLAY_ROWS} of {len(members)} members — response_format=json has all._"
+                )
             lines.extend(["", SIGN_NOTE])
         else:
             lines.append("_No members listed._")
@@ -427,11 +498,11 @@ async def splitwise_get_group(params: GetGroupInput) -> str:
         simplified: list[dict[str, Any]] = group.get("simplified_debts") or []
         original: list[dict[str, Any]] = group.get("original_debts") or []
         if simplified:
-            lines.extend(["", "## Simplified debts (A → B = A owes B)", ""])
-            lines.extend(_debt_lines(simplified[:MAX_DISPLAY_ROWS], names))
+            lines.extend(_debt_section("Simplified debts (A → B = A owes B)", simplified, names))
         elif original:
-            lines.extend(["", "## Original debts (no simplified debts returned; A → B = A owes B)", ""])
-            lines.extend(_debt_lines(original[:MAX_DISPLAY_ROWS], names))
+            lines.extend(
+                _debt_section("Original debts (no simplified debts returned; A → B = A owes B)", original, names)
+            )
         else:
             lines.extend(["", "## Debts", "", "_No outstanding debts — everyone is settled up._"])
         return clip_response("\n".join(lines))
@@ -471,7 +542,9 @@ async def splitwise_create_group(params: CreateGroupInput) -> str:
     - To find a friend's user id by name first (use `splitwise_resolve_friend`).
 
     Returns:
-    A confirmation echoing what Splitwise returned: the new group's name, id, type and members.
+    A confirmation echoing what Splitwise returned: the new group's name, id, type and
+    members, plus how many members were requested vs returned (a silently dropped invite
+    shows up there).
 
     Examples:
     - params = {"name": "Lima trip", "group_type": "trip", "members": [{"user_id": 5823}]}
@@ -494,15 +567,19 @@ async def splitwise_create_group(params: CreateGroupInput) -> str:
 
         client = get_client()
         resp = await client.request("POST", "/create_group", data=data)
-        group: dict[str, Any] = resp.json().get("group") or {}
+        group: dict[str, Any] = _body(resp).get("group") or {}
         if not group:
-            return "Splitwise answered without a group object — check `splitwise_get_groups` before retrying."
+            return (
+                "Splitwise answered HTTP 200 to POST /create_group without a group object — check "
+                "`splitwise_get_groups` before retrying or telling the user it was created."
+            )
         members: list[dict[str, Any]] = group.get("members") or []
         lines = [
             f"Created group **{_group_label(group)}**.",
             f"- **type**: {group.get('group_type') or 'N/A'}",
             f"- **simplify debts by default**: {group.get('simplify_by_default', 'N/A')}",
             f"- **members ({len(members)})**: " + (", ".join(fmt_person(m) for m in members) or "none listed"),
+            f"- requested {len(params.members)} member(s) besides you; Splitwise returned {len(members)} (incl. you).",
         ]
         if group.get("invite_link"):
             lines.append(f"- **invite link**: {group['invite_link']}")
@@ -523,23 +600,26 @@ async def splitwise_create_group(params: CreateGroupInput) -> str:
     ),
 )
 async def splitwise_delete_group(params: GroupIdInput) -> str:
-    """Delete a group AND every expense in it. 🔒 destructive write.
+    """Delete a group and all its expenses — for every member, not just you. 🔒 destructive write.
 
-    Calls `POST /delete_group/{id}`. Splitwise destroys the group's associated records —
-    all of its expenses go with it. Refused with `Error: … writes are disabled` unless
-    `SPLITWISE_ALLOW_WRITES=1`. Undo: `splitwise_undelete_group` with the same id restores
-    the group and its expenses.
+    Calls `POST /delete_group/{id}`. Splitwise destroys the group's associated records:
+    every expense in it disappears for all members. Refused with
+    `Error: … writes are disabled` unless `SPLITWISE_ALLOW_WRITES=1`. Undo:
+    `splitwise_undelete_group` with the same id restores the group and its expenses.
 
     When to Use:
-    - Only when the user explicitly asked to delete this group (confirm the id first with
-      `splitwise_get_group`).
+    - Only when the user explicitly asked to delete this group. Confirm the id first with
+      `splitwise_get_group`, and run `splitwise_get_expenses` with group_id so the user
+      knows how many expenses will go with it.
 
     When NOT to Use:
     - To leave a group or drop one member (use `splitwise_remove_user_from_group`).
     - To delete a single expense (use `splitwise_delete_expense`).
+    - With a group NAME — resolve it to an id first (use `splitwise_resolve_group`).
 
     Returns:
-    A confirmation with the `success` value Splitwise returned and how to undo it.
+    A confirmation with the `success` value Splitwise returned and how to undo it — or, when
+    the body does not say `success: true`, a note to verify before reporting it as deleted.
 
     Examples:
     - params = {"group_id": 12345}
@@ -549,12 +629,20 @@ async def splitwise_delete_group(params: GroupIdInput) -> str:
     `Error: Splitwise rejected the request ...`; 403 → not a member; 404 → wrong id or already deleted.
     """
     try:
+        path = f"/delete_group/{params.group_id}"
         client = get_client()
-        resp = await client.request("POST", f"/delete_group/{params.group_id}")
-        body: dict[str, Any] = resp.json() or {}
+        resp = await client.request("POST", path)
+        body = _body(resp)
+        if body.get("success") is not True:
+            return _unconfirmed(
+                path,
+                body,
+                verify=f"`splitwise_get_group` (group_id={params.group_id})",
+                outcome="it was deleted",
+            )
         return (
-            f"Deleted group id {params.group_id} ({_success_text(body)}). Its expenses were deleted with it; "
-            f"restore both with `splitwise_undelete_group` (group_id={params.group_id})."
+            f"Deleted group id {params.group_id} and all its expenses — for every member, not just you "
+            f"({_success_text(body)}). Restore both with `splitwise_undelete_group` (group_id={params.group_id})."
         )
     except Exception as exc:
         return handle_api_error(exc)
@@ -575,8 +663,8 @@ async def splitwise_undelete_group(params: GroupIdInput) -> str:
 
     Calls `POST /undelete_group/{id}`. Splitwise answers HTTP 200 even when this fails and
     puts the outcome in `success` / `errors`; the client turns a failure into an error,
-    and this tool renders the outcome the body reported. Refused with
-    `Error: … writes are disabled` unless `SPLITWISE_ALLOW_WRITES=1`. Undo:
+    and this tool reports the group as restored only when the body says `success: true`.
+    Refused with `Error: … writes are disabled` unless `SPLITWISE_ALLOW_WRITES=1`. Undo:
     `splitwise_delete_group`.
 
     When to Use:
@@ -585,9 +673,11 @@ async def splitwise_undelete_group(params: GroupIdInput) -> str:
     When NOT to Use:
     - To restore one expense (use `splitwise_undelete_expense`).
     - To re-add a removed member (use `splitwise_add_user_to_group`).
+    - With a group NAME — resolve it to an id first (use `splitwise_resolve_group`).
 
     Returns:
-    A confirmation with the `success` / `errors` values Splitwise returned.
+    A confirmation with the `success` / `errors` values Splitwise returned — or, when the
+    body does not say `success: true`, a note to verify before reporting it as restored.
 
     Examples:
     - params = {"group_id": 12345}
@@ -596,9 +686,17 @@ async def splitwise_undelete_group(params: GroupIdInput) -> str:
     `success: false` / non-empty `errors` come back as `Error: Splitwise rejected the request ...`.
     """
     try:
+        path = f"/undelete_group/{params.group_id}"
         client = get_client()
-        resp = await client.request("POST", f"/undelete_group/{params.group_id}")
-        body: dict[str, Any] = resp.json() or {}
+        resp = await client.request("POST", path)
+        body = _body(resp)
+        if body.get("success") is not True:
+            return _unconfirmed(
+                path,
+                body,
+                verify=f"`splitwise_get_group` (group_id={params.group_id})",
+                outcome="it was restored",
+            )
         return (
             f"Restored group id {params.group_id} ({_success_text(body)}). "
             f"Check it with `splitwise_get_group` (group_id={params.group_id})."
@@ -623,7 +721,8 @@ async def splitwise_add_user_to_group(params: AddUserToGroupInput) -> str:
     Calls `POST /add_user_to_group` with `group_id` plus EITHER `user_id` OR all of
     `first_name`, `last_name`, `email` (a oneOf, checked locally before any call; an
     invited email may receive a Splitwise invitation). Splitwise answers HTTP 200 even on
-    failure; the client turns `success: false` / non-empty `errors` into an error.
+    failure; the client turns `success: false` / non-empty `errors` into an error, and the
+    person is reported as added only when the body says `success: true` and returns the user.
     Refused with `Error: … writes are disabled` unless `SPLITWISE_ALLOW_WRITES=1`. Undo:
     `splitwise_remove_user_from_group` with the returned user id.
 
@@ -632,7 +731,8 @@ async def splitwise_add_user_to_group(params: AddUserToGroupInput) -> str:
 
     When NOT to Use:
     - To create a group with its members in one call (use `splitwise_create_group`).
-    - To find a friend's user id by name (use `splitwise_resolve_friend` first).
+    - To find a friend's user id by name (use `splitwise_resolve_friend` first), or a
+      group's id by name (use `splitwise_resolve_group`).
 
     Returns:
     A confirmation with the user Splitwise returned (`First Last (id N)`) and its `success` value.
@@ -649,13 +749,20 @@ async def splitwise_add_user_to_group(params: AddUserToGroupInput) -> str:
         data: dict[str, Any] = params.model_dump(exclude_none=True)
         client = get_client()
         resp = await client.request("POST", "/add_user_to_group", data=data)
-        body: dict[str, Any] = resp.json() or {}
+        body = _body(resp)
         user = body.get("user")
-        who = fmt_person(user) if user else "the user (no user object returned)"
+        if body.get("success") is not True or not isinstance(user, dict) or not user:
+            return _unconfirmed(
+                "/add_user_to_group",
+                body,
+                verify=f"`splitwise_get_group` (group_id={params.group_id})",
+                outcome="they were added",
+                extra="" if user else "; no user object returned",
+            )
+        undo_ids = f"group_id={params.group_id}" + (f", user_id={user['id']}" if user.get("id") is not None else "")
         return (
-            f"Added {who} to group id {params.group_id} ({_success_text(body)}). "
-            "Undo with `splitwise_remove_user_from_group`"
-            + (f" (group_id={params.group_id}, user_id={user['id']})." if user and user.get("id") else ".")
+            f"Added {fmt_person(user)} to group id {params.group_id} ({_success_text(body)}). "
+            f"Undo with `splitwise_remove_user_from_group` ({undo_ids})."
         )
     except Exception as exc:
         return handle_api_error(exc)
@@ -676,7 +783,8 @@ async def splitwise_remove_user_from_group(params: RemoveUserFromGroupInput) -> 
 
     Calls `POST /remove_user_from_group` with `group_id` and `user_id`. Splitwise refuses
     when the member has a non-zero balance in the group (settle up first) — and it does so
-    with HTTP 200 + `success: false`, which the client turns into an error. Refused with
+    with HTTP 200 + `success: false`, which the client turns into an error. The member is
+    reported as removed only when the body says `success: true`. Refused with
     `Error: … writes are disabled` unless `SPLITWISE_ALLOW_WRITES=1`. Undo:
     `splitwise_add_user_to_group` with the same ids.
 
@@ -686,9 +794,11 @@ async def splitwise_remove_user_from_group(params: RemoveUserFromGroupInput) -> 
     When NOT to Use:
     - To delete the whole group (use `splitwise_delete_group`).
     - To check balances first (use `splitwise_get_group`).
+    - With a group NAME — resolve it to an id first (use `splitwise_resolve_group`).
 
     Returns:
-    A confirmation with the `success` / `errors` values Splitwise returned.
+    A confirmation with the `success` / `errors` values Splitwise returned — or, when the
+    body does not say `success: true`, a note to verify before reporting it as removed.
 
     Examples:
     - params = {"group_id": 12345, "user_id": 5823}
@@ -701,7 +811,14 @@ async def splitwise_remove_user_from_group(params: RemoveUserFromGroupInput) -> 
         data: dict[str, Any] = {"group_id": params.group_id, "user_id": params.user_id}
         client = get_client()
         resp = await client.request("POST", "/remove_user_from_group", data=data)
-        body: dict[str, Any] = resp.json() or {}
+        body = _body(resp)
+        if body.get("success") is not True:
+            return _unconfirmed(
+                "/remove_user_from_group",
+                body,
+                verify=f"`splitwise_get_group` (group_id={params.group_id})",
+                outcome="they were removed",
+            )
         return (
             f"Removed user id {params.user_id} from group id {params.group_id} ({_success_text(body)}). "
             f"Undo with `splitwise_add_user_to_group` (group_id={params.group_id}, user_id={params.user_id})."
