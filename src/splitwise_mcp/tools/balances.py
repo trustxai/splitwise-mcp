@@ -9,10 +9,15 @@ client-side from what those two endpoints return.
 Sign conventions (stated again in each docstring):
 - friend balances: **positive = the friend owes you** (owed to you), negative = you owe them;
 - group member balances: **positive = the member is owed by the group**, negative = they owe.
+
+Amounts are parsed defensively: anything that is not a finite decimal below 1e15
+(`"1,000.00"`, `"NaN"`, `"1e30"`), and any entry without a `currency_code`, is shown raw
+and flagged, and is kept OUT of the totals — never silently counted as zero.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -33,6 +38,9 @@ GROUP_SIGN_CONVENTION = (
 )
 
 _TWO_PLACES = Decimal("0.01")
+# Above this an amount is not a plausible balance, and `quantize` would overflow the
+# default 28-digit context (`"1e30"` raised InvalidOperation and failed the whole tool).
+_MAX_MAGNITUDE = Decimal("1e15")
 
 
 # -- input models --------------------------------------------------------------
@@ -50,7 +58,8 @@ class GetBalancesInput(BaseModel):
     )
     include_zero: bool = Field(
         default=False,
-        description="When true, also list friends who are settled up (no non-zero balance in scope).",
+        description="When true, also list friends with no non-zero balance in scope (settled up, or — with "
+        "`currency` — no balance in that currency).",
     )
     response_format: ResponseFormat = Field(
         default=ResponseFormat.MARKDOWN,
@@ -75,7 +84,8 @@ class GetGroupBalancesInput(BaseModel):
         ...,
         ge=0,
         description="The group id (from `splitwise_get_groups` / `splitwise_resolve_group`). "
-        "0 = the non-group-expenses pseudo-group.",
+        "0 = the non-group-expenses pseudo-group (unverified on /get_group/0 until the live smoke; "
+        "on a 404 use `splitwise_get_balances`).",
     )
     response_format: ResponseFormat = Field(
         default=ResponseFormat.MARKDOWN,
@@ -94,15 +104,15 @@ class GetGroupBalancesInput(BaseModel):
 # -- helpers ---------------------------------------------------------------------
 
 
-def _to_decimal(amount: Any) -> Decimal | None:
-    """Parse a Splitwise amount string; None when missing or unparsable."""
-    if amount in (None, ""):
-        return None
+def _parse_amount(amount: Any) -> Decimal | None:
+    """A finite decimal with magnitude below 1e15, or None (unparsable, NaN/Infinity, absurd)."""
     try:
-        dec = Decimal(str(amount))
+        dec = Decimal(str(amount).strip())
     except (InvalidOperation, ValueError):
         return None
-    return dec if dec.is_finite() else None
+    if not dec.is_finite() or abs(dec) >= _MAX_MAGNITUDE:
+        return None
+    return dec
 
 
 def _wire(amount: Decimal) -> str:
@@ -110,28 +120,59 @@ def _wire(amount: Decimal) -> str:
     return f"{amount.quantize(_TWO_PLACES):f}"
 
 
-def _nonzero_entries(balances: Any, currency: str | None = None) -> list[tuple[str, Decimal]]:
-    """Non-zero `(CUR, amount)` pairs of a `balance` list, optionally restricted to one currency."""
+@dataclass(frozen=True)
+class _Entry:
+    """One non-zero (or unparsable) `{currency_code, amount}` balance entry."""
+
+    code: str  # upper-cased; "" when the API sent none
+    amount: Decimal | None  # None when the raw amount could not be parsed
+    raw: str
+
+    @property
+    def countable(self) -> bool:
+        """Whether the entry can go into the per-currency totals."""
+        return self.amount is not None and bool(self.code)
+
+    @property
+    def reason(self) -> str:
+        return "amount could not be parsed" if self.amount is None else "missing currency_code"
+
+    def render(self, *, signed: bool = True) -> str:
+        if self.amount is None:
+            return f"{self.raw} {self.code or 'unknown currency'} (unparsed)"
+        if not self.code:
+            return f"{fmt_money(self.amount, '', signed=signed)} (unknown currency)"
+        return fmt_money(self.amount, self.code, signed=signed)
+
+
+def _entries(balances: Any, currency: str | None = None) -> list[_Entry]:
+    """The non-zero and the unparsable entries of a `balance` list, optionally for one currency.
+
+    Zero amounts (`"0.0"`, `"-0.00"`, `"0.000"`) are dropped; missing amounts are not balances.
+    """
     if not isinstance(balances, list):
         return []
-    out: list[tuple[str, Decimal]] = []
-    for entry in balances:
-        if not isinstance(entry, dict):
+    out: list[_Entry] = []
+    for item in balances:
+        if not isinstance(item, dict):
             continue
-        code = str(entry.get("currency_code") or "").upper()
+        code = str(item.get("currency_code") or "").strip().upper()
         if currency is not None and code != currency:
             continue
-        dec = _to_decimal(entry.get("amount"))
-        if dec is None or dec == 0:
+        raw = item.get("amount")
+        if raw in (None, ""):
             continue
-        out.append((code, dec))
+        dec = _parse_amount(raw)
+        if dec is not None and dec == 0:
+            continue
+        out.append(_Entry(code=code, amount=dec, raw=str(raw)))
     return out
 
 
-def _fmt_entries(entries: list[tuple[str, Decimal]]) -> str:
+def _fmt_entries(entries: list[_Entry], *, empty: str = "settled up") -> str:
     if not entries:
-        return "settled up"
-    return ", ".join(fmt_money(amount, code) for code, amount in entries)
+        return empty
+    return ", ".join(entry.render() for entry in entries)
 
 
 def _cell(value: Any) -> str:
@@ -142,6 +183,28 @@ def _cell(value: Any) -> str:
 
 def _sort_name(user: dict[str, Any]) -> str:
     return " ".join(str(user.get(k) or "") for k in ("first_name", "last_name")).casefold()
+
+
+def _dedupe_by_id(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep the first object per `id` (objects without an id are all kept)."""
+    seen: set[Any] = set()
+    out: list[dict[str, Any]] = []
+    for item in items:
+        key = item.get("id")
+        if key is not None:
+            if key in seen:
+                continue
+            seen.add(key)
+        out.append(item)
+    return out
+
+
+def _unparsed_note(count: int) -> str:
+    noun, verb = ("entry", "is") if count == 1 else ("entries", "are")
+    return (
+        f"_{count} balance {noun} could not be parsed (amount or currency) and {verb} not in the totals; "
+        "they are marked `(unparsed)` / `(unknown currency)` in the rows._"
+    )
 
 
 # -- splitwise_get_balances -------------------------------------------------------
@@ -166,7 +229,8 @@ async def splitwise_get_balances(params: GetBalancesInput) -> str:
     expenses. Sign convention: **positive = the friend owes you (owed to you); negative =
     you owe the friend.** Zero balances are hidden unless `include_zero` is true; the
     optional `currency` filter keeps a single currency (applied locally — the endpoint
-    takes no filter).
+    takes no filter). An amount Splitwise sends that is not a plain decimal, or an entry
+    with no currency, is shown raw and flagged, and left out of the totals.
 
     When to Use:
     - "How much am I owed / do I owe overall?", "who owes me money?", "my USD balance".
@@ -179,10 +243,12 @@ async def splitwise_get_balances(params: GetBalancesInput) -> str:
 
     Returns:
     Markdown: the sign convention, a totals table (`Currency | You are owed | You owe | Net`)
-    and a table of friends (`First Last (id N)` with e.g. `+12.50 USD, -3.00 PEN`), capped at
-    50 rows (totals always cover every friend). JSON: `{sign_convention, currency_filter,
-    totals: {CUR: {owed_to_you, you_owe, net}}, friend_count, friends: [raw friend objects]}`
-    with `you_owe` as a positive magnitude and money as 2-decimal strings.
+    and a table of friends (`First Last (id N)` with e.g. `+12.50 USD, -3.00 PEN`; with
+    `include_zero`, `settled up` or `no USD balance`), capped at 50 rows (totals cover every
+    friend except the flagged entries). JSON: `{sign_convention, currency_filter, totals:
+    {CUR: {owed_to_you, you_owe, net}}, unparsed: [{friend_id, currency_code, amount, reason}],
+    friend_count, friends: [raw friend objects]}` with `you_owe` as a positive magnitude and
+    money as 2-decimal strings.
 
     Examples:
     - params = {}
@@ -197,16 +263,27 @@ async def splitwise_get_balances(params: GetBalancesInput) -> str:
     try:
         client = get_client()
         resp = await client.request("GET", "/get_friends")
-        friends: list[dict[str, Any]] = [f for f in (resp.json().get("friends") or []) if isinstance(f, dict)]
+        friends = _dedupe_by_id([f for f in (resp.json().get("friends") or []) if isinstance(f, dict)])
 
         owed: dict[str, Decimal] = {}
         owe: dict[str, Decimal] = {}
-        rows: list[tuple[dict[str, Any], list[tuple[str, Decimal]]]] = []
+        unparsed: list[dict[str, Any]] = []
+        rows: list[tuple[dict[str, Any], list[_Entry]]] = []
         for friend in friends:
-            entries = _nonzero_entries(friend.get("balance"), params.currency)
-            for code, amount in entries:
-                bucket = owed if amount > 0 else owe
-                bucket[code] = bucket.get(code, Decimal(0)) + amount
+            entries = _entries(friend.get("balance"), params.currency)
+            for entry in entries:
+                if entry.countable and entry.amount is not None:
+                    bucket = owed if entry.amount > 0 else owe
+                    bucket[entry.code] = bucket.get(entry.code, Decimal(0)) + entry.amount
+                else:
+                    unparsed.append(
+                        {
+                            "friend_id": friend.get("id"),
+                            "currency_code": entry.code or None,
+                            "amount": entry.raw,
+                            "reason": entry.reason,
+                        }
+                    )
             if entries or params.include_zero:
                 rows.append((friend, entries))
         rows.sort(key=lambda row: (_sort_name(row[0]), str(row[0].get("id"))))
@@ -228,6 +305,7 @@ async def splitwise_get_balances(params: GetBalancesInput) -> str:
                         "sign_convention": FRIEND_SIGN_CONVENTION,
                         "currency_filter": params.currency,
                         "totals": totals,
+                        "unparsed": unparsed,
                         "friend_count": len(rows),
                         "friends": [friend for friend, _ in rows],
                     }
@@ -239,9 +317,7 @@ async def splitwise_get_balances(params: GetBalancesInput) -> str:
         if params.currency:
             lines.append(f"Currency filter: {params.currency}.")
         lines.append("")
-        if not currencies:
-            lines.append(f"_You are settled up with every friend{scope}._")
-        else:
+        if currencies:
             lines.extend(
                 [
                     "## Totals by currency",
@@ -256,11 +332,18 @@ async def splitwise_get_balances(params: GetBalancesInput) -> str:
                     f"{fmt_money(-owe.get(code, zero), code, signed=False)} | "
                     f"{fmt_money(owed.get(code, zero) + owe.get(code, zero), code)} |"
                 )
+        elif not unparsed:
+            lines.append(f"_You are settled up with every friend{scope}._")
+        if unparsed:
+            lines.extend(["", _unparsed_note(len(unparsed))])
         if rows:
             title = "Friends" if params.include_zero else "Friends with a balance"
             lines.extend(["", f"## {title} ({len(rows)})", "", "| Friend | Balance |", "|---|---|"])
             for friend, entries in rows[:MAX_DISPLAY_ROWS]:
-                lines.append(f"| {_cell(fmt_person(friend))} | {_cell(_fmt_entries(entries))} |")
+                empty = "settled up"
+                if params.currency and _entries(friend.get("balance")):
+                    empty = f"no {params.currency} balance"
+                lines.append(f"| {_cell(fmt_person(friend))} | {_cell(_fmt_entries(entries, empty=empty))} |")
             if len(rows) > MAX_DISPLAY_ROWS:
                 lines.append(
                     f"\n_Showing {MAX_DISPLAY_ROWS} of {len(rows)} friends (totals cover all of them); "
@@ -278,9 +361,10 @@ def _debt_line(debt: dict[str, Any], names: dict[Any, str]) -> str:
     frm, to = debt.get("from"), debt.get("to")
     who_from = names.get(frm) or fmt_person(None, fallback_id=frm)
     who_to = names.get(to) or fmt_person(None, fallback_id=to)
-    return (
-        f"- {who_from} → {who_to} {fmt_money(debt.get('amount'), str(debt.get('currency_code') or ''), signed=False)}"
-    )
+    code = str(debt.get("currency_code") or "").strip().upper()
+    raw = debt.get("amount")
+    amount = _Entry(code=code, amount=_parse_amount(raw), raw=str(raw)).render(signed=False)
+    return f"- {who_from} → {who_to} {amount}"
 
 
 @mcp.tool(
@@ -301,7 +385,8 @@ async def splitwise_get_group_balances(params: GetGroupBalancesInput) -> str:
     resolved from the group's own `members` (an id not among them is shown as `user N`).
     Uses `simplified_debts`; when Splitwise returns none, falls back to `original_debts`
     and says so. Sign convention: **positive = the member is owed by the group; negative =
-    the member owes the group.** Settled-up members are listed by name only.
+    the member owes the group.** Settled-up members are listed by name only. An amount
+    that is not a plain decimal is shown raw and flagged `(unparsed)`.
 
     When to Use:
     - "Who owes whom in the Trip group?", "how do we settle up the apartment?".
@@ -309,6 +394,9 @@ async def splitwise_get_group_balances(params: GetGroupBalancesInput) -> str:
 
     When NOT to Use:
     - For your balances across all friends (use `splitwise_get_balances`).
+    - For non-group expenses: group_id 0 is the non-group pseudo-group in `get_groups`, but
+      whether `/get_group/0` answers is unverified until the live smoke — on a 404, use
+      `splitwise_get_balances`.
     - For the group's details, invite link or membership changes (use `splitwise_get_group`,
       `splitwise_add_user_to_group`, `splitwise_remove_user_from_group`).
     - To find a group id from its name (use `splitwise_resolve_group` / `splitwise_get_groups`).
@@ -325,7 +413,8 @@ async def splitwise_get_group_balances(params: GetGroupBalancesInput) -> str:
 
     Error Handling:
     403 means you are not a member of that group; 404 means the id is wrong or the group
-    was deleted (`splitwise_undelete_group` restores it). Errors come back as an
+    was deleted (`splitwise_undelete_group` restores it) — or, for group_id 0, that the
+    pseudo-group is not served here (use `splitwise_get_balances`). Errors come back as an
     `Error ...` string.
     """
     try:
@@ -360,7 +449,7 @@ async def splitwise_get_group_balances(params: GetGroupBalancesInput) -> str:
         label = f"{group.get('name') or '(unnamed)'} (id {group.get('id', params.group_id)})"
         lines = [f"# Balances in {label}", "", GROUP_SIGN_CONVENTION, ""]
 
-        with_balance = [(m, _nonzero_entries(m.get("balance"))) for m in members]
+        with_balance = [(m, _entries(m.get("balance"))) for m in members]
         owing = [(m, entries) for m, entries in with_balance if entries]
         settled = [m for m, entries in with_balance if not entries]
         if owing:

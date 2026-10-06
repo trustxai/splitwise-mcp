@@ -355,6 +355,168 @@ async def test_group_balances_forbidden(monkeypatch: pytest.MonkeyPatch) -> None
     assert "You are not a member of this group" in result
 
 
+# -- review findings: edge amounts, unparsed entries, filter + include_zero, caps ---
+
+
+async def test_get_balances_zero_forms_hidden_and_plus_sign_parsed(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(
+        monkeypatch,
+        {
+            "/get_friends": {
+                "friends": [
+                    _friend(
+                        21,
+                        "Zed",
+                        "Zero",
+                        [
+                            {"currency_code": "USD", "amount": "-0.00"},
+                            {"currency_code": "PEN", "amount": "0.000"},
+                            {"currency_code": "EUR", "amount": "+5.00"},
+                        ],
+                    )
+                ]
+            }
+        },
+    )
+
+    result = await splitwise_get_balances(GetBalancesInput())
+
+    assert "| Zed Zero (id 21) | +5.00 EUR |" in result
+    assert "| EUR | 5.00 EUR | 0.00 EUR | +5.00 EUR |" in result
+    assert "USD" not in result
+    assert "PEN" not in result
+    assert "could not be parsed" not in result
+
+
+UNPARSED_FRIENDS = {
+    "friends": [
+        _friend(31, "Ann", "Comma", [{"currency_code": "USD", "amount": "1,000.00"}]),
+        _friend(
+            32,
+            "Ben",
+            "Nan",
+            [{"currency_code": "PEN", "amount": "NaN"}, {"currency_code": "USD", "amount": "10.00"}],
+        ),
+        _friend(33, "Cat", "Huge", [{"currency_code": "USD", "amount": "1e30"}]),
+        _friend(34, "Dan", "Nocode", [{"amount": "5.00"}]),
+    ]
+}
+
+
+async def test_get_balances_flags_unparsed_amounts_and_missing_currency(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(monkeypatch, {"/get_friends": UNPARSED_FRIENDS})
+
+    result = await splitwise_get_balances(GetBalancesInput())
+
+    assert not result.startswith("Error"), result
+    # Only the one parseable, currency-bearing entry reaches the totals.
+    assert "| USD | 10.00 USD | 0.00 USD | +10.00 USD |" in result
+    assert "| N/A |" not in result
+    assert "| PEN |" not in result
+    assert (
+        "_4 balance entries could not be parsed (amount or currency) and are not in the totals; "
+        "they are marked `(unparsed)` / `(unknown currency)` in the rows._"
+    ) in result
+    assert "| Ann Comma (id 31) | 1,000.00 USD (unparsed) |" in result
+    assert "| Ben Nan (id 32) | NaN PEN (unparsed), +10.00 USD |" in result
+    assert "| Cat Huge (id 33) | 1e30 USD (unparsed) |" in result
+    assert "| Dan Nocode (id 34) | +5.00 (unknown currency) |" in result
+    assert "settled up" not in result
+
+
+async def test_get_balances_json_lists_unparsed(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(monkeypatch, {"/get_friends": UNPARSED_FRIENDS})
+
+    payload = json.loads(await splitwise_get_balances(GetBalancesInput(response_format="json")))
+
+    assert payload["totals"] == {"USD": {"owed_to_you": "10.00", "you_owe": "0.00", "net": "10.00"}}
+    assert payload["unparsed"] == [
+        {"friend_id": 31, "currency_code": "USD", "amount": "1,000.00", "reason": "amount could not be parsed"},
+        {"friend_id": 32, "currency_code": "PEN", "amount": "NaN", "reason": "amount could not be parsed"},
+        {"friend_id": 33, "currency_code": "USD", "amount": "1e30", "reason": "amount could not be parsed"},
+        {"friend_id": 34, "currency_code": None, "amount": "5.00", "reason": "missing currency_code"},
+    ]
+    assert payload["friend_count"] == 4
+
+
+async def test_get_balances_only_unparsed_is_not_called_settled(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(
+        monkeypatch,
+        {"/get_friends": {"friends": [_friend(41, "Eve", "Odd", [{"currency_code": "USD", "amount": "abc"}])]}},
+    )
+
+    result = await splitwise_get_balances(GetBalancesInput(include_zero=True))
+
+    assert "settled up" not in result
+    assert "Totals by currency" not in result
+    assert "_1 balance entry could not be parsed (amount or currency) and is not in the totals;" in result
+    assert "| Eve Odd (id 41) | abc USD (unparsed) |" in result
+
+
+async def test_get_balances_currency_filter_with_include_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _install(monkeypatch, {"/get_friends": FRIENDS})
+
+    result = await splitwise_get_balances(GetBalancesInput(currency="USD", include_zero=True))
+
+    assert fake.calls == [("GET", "/get_friends", {})]
+    assert "## Friends (5)" in result
+    # Alan only owes in PEN: not "settled up", just nothing in USD.
+    assert "| Alan Kay (id 15) | no USD balance |" in result
+    # Margaret (USD 0.0) and Ken (no entries) have nothing open in any currency.
+    assert "| Margaret Hamilton (id 13) | settled up |" in result
+    assert "| Ken Thompson (id 14) | settled up |" in result
+    assert "| Grace Hopper (id 12) | +30.00 USD |" in result
+    assert "| USD | 30.00 USD | 12.50 USD | +17.50 USD |" in result
+
+
+async def test_get_balances_dedupes_friends_by_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    twice = _friend(51, "Dup", "Licate", [{"currency_code": "USD", "amount": "40.00"}])
+    _install(monkeypatch, {"/get_friends": {"friends": [twice, dict(twice)]}})
+
+    result = await splitwise_get_balances(GetBalancesInput())
+
+    assert "| USD | 40.00 USD | 0.00 USD | +40.00 USD |" in result
+    assert "## Friends with a balance (1)" in result
+    assert result.count("Dup Licate (id 51)") == 1
+
+
+async def test_group_balances_caps_members_and_debts(monkeypatch: pytest.MonkeyPatch) -> None:
+    n = MAX_DISPLAY_ROWS + 5
+    members = [_member(200 + i, f"M{i:03d}", None, [{"currency_code": "USD", "amount": "1.00"}]) for i in range(n)]
+    debts = [{"from": 200 + i, "to": 1, "amount": "1.00", "currency_code": "USD"} for i in range(n)]
+    body = {"group": {"id": 9, "name": "Big", "members": members, "simplified_debts": debts, "original_debts": []}}
+    fake = _install(monkeypatch, {"/get_group/9": body})
+
+    result = await splitwise_get_group_balances(GetGroupBalancesInput(group_id=9))
+
+    assert fake.calls == [("GET", "/get_group/9", {})]
+    assert f"## Members with a balance ({n})" in result
+    assert result.count("| +1.00 USD |") == MAX_DISPLAY_ROWS
+    assert f"Showing {MAX_DISPLAY_ROWS} of {n} members; use response_format='json'." in result
+    assert result.count("→ user 1 1.00 USD") == MAX_DISPLAY_ROWS
+    assert f"Showing {MAX_DISPLAY_ROWS} of {n} debts; use response_format='json'." in result
+
+
+async def test_group_balances_flags_unparsed_amounts(monkeypatch: pytest.MonkeyPatch) -> None:
+    body = _group([{"from": 2, "to": 1, "amount": "Infinity", "currency_code": "USD"}], [])
+    body["group"]["members"][0]["balance"] = [{"currency_code": "USD", "amount": "1e30"}]
+    _install(monkeypatch, {"/get_group/77": body})
+
+    result = await splitwise_get_group_balances(GetGroupBalancesInput(group_id=77))
+
+    assert not result.startswith("Error"), result
+    assert "| Ada Lovelace (id 1) | 1e30 USD (unparsed) |" in result
+    assert "- Bob (id 2) → Ada Lovelace (id 1) Infinity USD (unparsed)" in result
+
+
+def test_group_id_zero_is_documented_as_unverified() -> None:
+    doc = " ".join((splitwise_get_group_balances.__doc__ or "").split())
+    assert "whether `/get_group/0` answers is unverified until the live smoke" in doc
+    assert "on a 404, use `splitwise_get_balances`" in doc
+    field_doc = GetGroupBalancesInput.model_fields["group_id"].description or ""
+    assert "unverified on /get_group/0 until the live smoke" in field_doc
+
+
 # -- live smoke (read-only; skipped without SPLITWISE_API_KEY) ---------------------
 
 
