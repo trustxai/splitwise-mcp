@@ -22,6 +22,8 @@ from splitwise_mcp.server import mcp
 from splitwise_mcp.validators import date_iso
 
 MAX_DISPLAY_ROWS = 50
+# Markdown-mode cap on one notification's text; JSON mode always carries the full HTML.
+MAX_CELL_CHARS = 2_000
 
 # research/02-endpoint-inventory.md §F — Splitwise documents this list as incomplete.
 NOTIFICATION_TYPES: dict[int, str] = {
@@ -45,6 +47,13 @@ NOTIFICATION_TYPES: dict[int, str] = {
 
 # `<strike>old</strike>` marks a replaced value; keep that meaning as ~~old~~ before the tags are stripped.
 _STRIKE_RE = re.compile(r"<strike\b[^>]*>(.*?)</strike\s*>", re.IGNORECASE | re.DOTALL)
+_INNER_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _strike(match: re.Match[str]) -> str:
+    """`~~old~~` with the inner text trimmed (GFM needs no space inside the tildes); empty → nothing."""
+    inner = _INNER_TAG_RE.sub("", match.group(1)).strip()
+    return f"~~{inner}~~" if inner else ""
 
 
 def notification_type_name(code: Any) -> str:
@@ -55,13 +64,31 @@ def notification_type_name(code: Any) -> str:
 
 
 def notification_text(content: Any) -> str:
-    """Flatten notification HTML to plain text, keeping struck-through values as `~~old~~`."""
-    return strip_html(_STRIKE_RE.sub(r"~~\1~~", str(content if content is not None else "")))
+    """Flatten notification HTML to plain text, keeping struck-through values as `~~old~~`.
+
+    A `~` already in the text is escaped as `\\~` first, so only the struck values read as strikethrough.
+    """
+    text = str(content if content is not None else "").replace("~", "\\~")
+    return strip_html(_STRIKE_RE.sub(_strike, text))
 
 
 def _cell(text: str) -> str:
-    """Make a value safe inside a markdown table cell (escape pipes, keep line breaks as `<br>`)."""
-    return text.replace("\r\n", "\n").strip().replace("|", "\\|").replace("\n", "<br>")
+    """Keep a value on one markdown line: escape pipes and render every line break as `<br>`.
+
+    `str.splitlines` splits on every line boundary (`\\n`, `\\r`, `\\r\\n`, `\\v`, `\\f`, U+2028, …), so a
+    bare carriage return (or a `&#13;` that `strip_html` unescaped into one) cannot end the table row.
+    """
+    return "<br>".join(text.strip().replace("|", "\\|").splitlines())
+
+
+def _content(text: str) -> str:
+    """`_cell` for the notification text, capped at MAX_CELL_CHARS with a note saying how much was cut."""
+    flat = text.strip()
+    if len(flat) > MAX_CELL_CHARS:
+        flat = (
+            f"{flat[:MAX_CELL_CHARS]}…[+{len(flat) - MAX_CELL_CHARS} chars — response_format='json' for the full text]"
+        )
+    return _cell(flat)
 
 
 def _source(source: dict[str, Any] | None) -> str:
@@ -79,7 +106,7 @@ def _notification_row(item: dict[str, Any]) -> str:
     by = fmt_person(None, fallback_id=created_by) if created_by is not None else "—"
     return (
         f"| {iso_to_human(item.get('created_at'))} | {notification_type_name(item.get('type'))} "
-        f"| {_cell(notification_text(item.get('content')))} | {_source(item.get('source'))} | {by} "
+        f"| {_content(notification_text(item.get('content')))} | {_source(item.get('source'))} | {by} "
         f"| {item.get('id', 'N/A')} |"
     )
 
@@ -148,7 +175,7 @@ async def splitwise_get_notifications(params: GetNotificationsInput) -> str:
 
     Returns:
     Markdown: `| When | Type | Content | Source | By | Id |`, at most 50 rows (the rest
-    are counted). JSON: `{"count", "limit", "updated_after", "type_names", "notifications":
+    counted; each text capped at 2,000 characters, the cut counted). JSON: `{"count", "limit", "updated_after", "type_names", "notifications":
     [raw objects]}` — `content` stays raw HTML there, and `type_names` maps the codes
     present to their names.
 

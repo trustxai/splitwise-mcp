@@ -7,11 +7,13 @@ from typing import Any
 
 import httpx
 import pytest
+from mcp.server.fastmcp.exceptions import ToolError
 from pydantic import ValidationError
 
 from splitwise_mcp.config import get_settings
 from splitwise_mcp.server import mcp
 from splitwise_mcp.tools.notifications import (
+    MAX_CELL_CHARS,
     MAX_DISPLAY_ROWS,
     GetNotificationsInput,
     notification_text,
@@ -164,6 +166,30 @@ async def test_markdown_caps_rows(monkeypatch: pytest.MonkeyPatch) -> None:
     assert f"Showing the newest {MAX_DISPLAY_ROWS} of {MAX_DISPLAY_ROWS + 10}" in result
 
 
+async def test_markdown_caps_long_text_and_json_keeps_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    long = {**EXPENSE_ADDED, "content": "<strong>" + "z" * (MAX_CELL_CHARS + 42) + "</strong>"}
+    fake = _FakeClient(routes={"/get_notifications": {"notifications": [long]}})
+    _install(monkeypatch, fake)
+
+    markdown = await splitwise_get_notifications(GetNotificationsInput())
+    raw = await splitwise_get_notifications(GetNotificationsInput(response_format="json"))  # type: ignore[arg-type]
+
+    assert f"| {'z' * MAX_CELL_CHARS}…[+42 chars — response_format='json' for the full text] |" in markdown
+    assert json.loads(raw)["notifications"][0]["content"] == long["content"]
+    assert fake.calls == [("GET", "/get_notifications", {"params": {"limit": 20}})] * 2
+
+
+async def test_carriage_returns_cannot_break_the_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    tricky = {**EXPENSE_ADDED, "content": "one\rtwo&#13;three"}
+    fake = _FakeClient(routes={"/get_notifications": {"notifications": [tricky]}})
+    _install(monkeypatch, fake)
+
+    result = await splitwise_get_notifications(GetNotificationsInput())
+
+    assert "| one<br>two<br>three |" in result
+    assert "\r" not in result
+
+
 async def test_unauthorized_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeClient(
         routes={"/get_notifications": _status_error(401, {"error": "Invalid API request: you are not logged in"})}
@@ -172,6 +198,7 @@ async def test_unauthorized_is_reported(monkeypatch: pytest.MonkeyPatch) -> None
 
     result = await splitwise_get_notifications(GetNotificationsInput())
 
+    assert fake.calls == [("GET", "/get_notifications", {"params": {"limit": 20}})]
     assert result.startswith("Error (401): Unauthorized – Invalid API request: you are not logged in.")
     assert "secure.splitwise.com/apps" in result
 
@@ -192,6 +219,18 @@ def test_updated_after_with_offset_is_converted_to_utc() -> None:
 def test_limit_out_of_range_is_rejected(limit: int) -> None:
     with pytest.raises(ValidationError, match="limit"):
         GetNotificationsInput(limit=limit)
+
+
+async def test_out_of_range_limit_is_rejected_through_the_nested_params_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeClient(routes={"/get_notifications": FEED})
+    _install(monkeypatch, fake)
+
+    with pytest.raises(ToolError, match="less than or equal to 100"):
+        await mcp.call_tool("splitwise_get_notifications", {"params": {"limit": 101}})
+
+    assert fake.calls == []
 
 
 def test_extra_fields_are_forbidden() -> None:
@@ -221,6 +260,12 @@ def test_notification_text_keeps_struck_values() -> None:
         "cost ~~$10.00~~ $12.00\nby Bob"
     )
     assert notification_text(None) == ""
+
+
+def test_notification_text_strike_edge_cases() -> None:
+    assert notification_text("cost <strike> $10 </strike> $12") == "cost ~~$10~~ $12"
+    assert notification_text("cost <strike> </strike>$12") == "cost $12"
+    assert notification_text("<strike><strong>$10</strong></strike> ~approx") == "~~$10~~ \\~approx"
 
 
 async def test_notifications_tool_is_registered_read_only() -> None:

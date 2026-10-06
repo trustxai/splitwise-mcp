@@ -19,12 +19,26 @@ from splitwise_mcp.formatters import ResponseFormat, clip_response, fmt_person, 
 from splitwise_mcp.server import mcp
 
 MAX_DISPLAY_ROWS = 50
+# Markdown-mode cap on one comment's text; JSON mode always carries the full text.
+MAX_CELL_CHARS = 2_000
 
 
 def _cell(text: Any) -> str:
-    """Make a value safe inside a markdown table cell (escape pipes, keep line breaks as `<br>`)."""
-    flat = str(text if text is not None else "").replace("\r\n", "\n").strip()
-    return flat.replace("|", "\\|").replace("\n", "<br>")
+    """Keep a value on one markdown line: escape pipes and render every line break as `<br>`.
+
+    `str.splitlines` splits on every line boundary (`\\n`, `\\r`, `\\r\\n`, `\\v`, `\\f`, U+2028, …), so
+    no bare carriage return can end a table row or start a fake heading in a confirmation.
+    """
+    flat = str(text if text is not None else "").strip().replace("|", "\\|")
+    return "<br>".join(flat.splitlines())
+
+
+def _content(text: Any, hint: str) -> str:
+    """`_cell` for free text, capped at MAX_CELL_CHARS with a note saying how much was cut."""
+    flat = str(text if text is not None else "").strip()
+    if len(flat) > MAX_CELL_CHARS:
+        flat = f"{flat[:MAX_CELL_CHARS]}…[+{len(flat) - MAX_CELL_CHARS} chars — {hint}]"
+    return _cell(flat)
 
 
 def _author(comment: dict[str, Any]) -> str:
@@ -33,7 +47,7 @@ def _author(comment: dict[str, Any]) -> str:
 
 
 def _comment_row(comment: dict[str, Any]) -> str:
-    content = _cell(comment.get("content"))
+    content = _content(comment.get("content"), "response_format='json' for the full text")
     if comment.get("deleted_at"):
         content = f"_[deleted {iso_to_human(comment['deleted_at'])}]_ {content}"
     return (
@@ -48,13 +62,13 @@ def _comment_block(comment: dict[str, Any]) -> list[str]:
         f"- **comment id**: {comment.get('id', 'N/A')}",
         f"- **expense id**: {comment.get('relation_id', 'N/A')}"
         + (f" ({comment['relation_type']})" if comment.get("relation_type") else ""),
-        f"- **author**: {_author(comment)}",
+        f"- **author**: {_cell(_author(comment))}",
         f"- **type**: {comment.get('comment_type') or 'N/A'}",
         f"- **created**: {iso_to_human(comment.get('created_at'))}",
     ]
     if comment.get("deleted_at"):
         lines.append(f"- **deleted**: {iso_to_human(comment.get('deleted_at'))}")
-    lines.append(f"- **content**: {comment.get('content') or ''}")
+    lines.append(f"- **content**: {_content(comment.get('content'), 'truncated in this confirmation')}")
     return lines
 
 
@@ -114,8 +128,8 @@ async def splitwise_get_comments(params: GetCommentsInput) -> str:
     - To find an expense id from a description — use `splitwise_get_expenses`.
 
     Returns:
-    Markdown: a table `| Id | Author | Type | Created | Content |` (at most 50 rows; the
-    rest are counted). JSON: `{"expense_id", "count", "comments": [raw comment objects]}`.
+    Markdown: a table `| Id | Author | Type | Created | Content |` (at most 50 rows, the
+    rest counted; each text capped at 2,000 characters, the cut counted). JSON: `{"expense_id", "count", "comments": [raw comment objects]}`.
 
     Examples:
     - `params = {"expense_id": 51023}`
@@ -257,7 +271,8 @@ async def splitwise_delete_comment(params: DeleteCommentInput) -> str:
         if not comment:
             return (
                 f"Splitwise accepted the delete of comment {params.comment_id} but returned no `comment` object "
-                "— check with `splitwise_get_comments` that it is gone."
+                "— check with `splitwise_get_comments` that it is gone (it needs the expense id — find it with "
+                "`splitwise_get_expense` / `splitwise_get_expenses`)."
             )
         return clip_response("\n".join(["# Comment deleted", "", *_comment_block(comment)]))
     except Exception as exc:
