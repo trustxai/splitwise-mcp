@@ -1,0 +1,91 @@
+{
+  "company": "trustai",
+  "board": {
+    "backend": "repo",
+    "tasks_file": ".memory/tasks.yaml",
+    "memory_dir": ".memory"
+  },
+  "gates": {
+    "default": "uv run pytest -m \"not live\" && uv run ruff check src/ tests/ && uv run ruff format --check src/ tests/ && uv run mypy src/",
+    "live_smoke": "uv run pytest -m live",
+    "readme_table": "uv run python scripts/gen_tool_table.py --check"
+  },
+  "routing": {
+    "critical": "claude-fable-5-1",
+    "feature": "claude-opus-5-5",
+    "mechanical": "claude-opus-5-5",
+    "reduction": "claude-haiku-4-5"
+  },
+  "effort": {
+    "critical": "xhigh",
+    "feature": "xhigh",
+    "mechanical": "medium",
+    "reduction": "low"
+  },
+  "max_parallel": 5,
+  "merge_policy": "human",
+  "review": {
+    "default": "code-review",
+    "flagged_paths": {
+      "src/splitwise_mcp/client.py": "ultra+security-review",
+      "src/splitwise_mcp/config.py": "ultra+security-review",
+      "src/splitwise_mcp/http.py": "ultra+security-review",
+      "src/splitwise_mcp/tools/expenses.py": "ultra+security-review",
+      ".github/workflows/*": "ultra+security-review"
+    }
+  },
+  "creds": {
+    "db": "staging-or-local-only"
+  },
+  "caps": {
+    "loop_iterations": 8,
+    "target_max_turns": 25
+  },
+  "interactive_only": [
+    "auth spike",
+    "schema review",
+    "architecture / strangler design",
+    "cutover",
+    "product decision",
+    "PyPI / OIDC trusted-publishing setup",
+    "GitHub repo creation + branch protection",
+    "release cut",
+    "live smoke against the real Splitwise account (personal API key)",
+    "Splitwise API key creation / rotation",
+    "alejlatorre-mcps registration + hot deploy with live sessions",
+    "ax42 systemd unit + Tailscale Funnel path (sudo, public exposure)",
+    "Grok Bot connector (UI) + end-to-end check through the public URL"
+  ],
+  "reversibility_triggers": [
+    {
+      "decision": "publish to PyPI as `amazing-splitwise-mcp` (ADR-0001; `splitwise-mcp` and `splitwise-mcp-server` are taken)",
+      "trigger": "the user registers the pending trusted publisher under a different free name (e.g. `trustai-splitwise-mcp`)",
+      "fallback": "rename dist + console scripts in lockstep on main before the first release; import package `splitwise_mcp` and tool prefix `splitwise_` never change"
+    },
+    {
+      "decision": "stdio stays the default transport; streamable-http is a second console script (`amazing-splitwise-mcp-http`) that refuses to start without SPLITWISE_MCP_BEARER and binds 127.0.0.1 by default (ships in v0.1 because Grok Bot only takes a public URL)",
+      "trigger": "a client needs OAuth (discovery + token issuance) instead of a static bearer, or Grok rejects a custom Authorization header",
+      "fallback": "keep the ASGI bearer middleware and add the SDK's TokenVerifier/AuthSettings path behind a second env flag; stdio and the static bearer remain"
+    },
+    {
+      "decision": "host the public endpoint on ax42 as a systemd user unit behind the existing Tailscale Funnel (second path /splitwise on the 443 that already serves Obsidian)",
+      "trigger": "ax42 is unreachable for a day, Funnel is disabled for the tailnet, or a second Grok-facing MCP needs its own hostname",
+      "fallback": "run the same Dockerfile as a Railway service with SPLITWISE_MCP_BEARER as a Railway variable and point Grok at the Railway domain"
+    },
+    {
+      "decision": "name resolution (friend / group / category) uses stdlib difflib, no rapidfuzz dependency",
+      "trigger": "a live-smoke query with a real name mis-resolves (wrong top match) or a resolve tool exceeds 200 ms on the real friend list",
+      "fallback": "add `rapidfuzz` as a runtime dependency and swap the scorer in tools/lookup.py only"
+    },
+    {
+      "decision": "raw httpx client + in-repo form flattening (users__{i}__{prop}), no `splitwise` SDK dependency",
+      "trigger": "an endpoint needs a serialization quirk that costs more than a day to reproduce",
+      "fallback": "vendor the exact helper from the reference client (MIT) with attribution; still no SDK dependency"
+    },
+    {
+      "decision": "writes are gated by SPLITWISE_ALLOW_WRITES (default off); the ax42 unit turns it on deliberately for Grok",
+      "trigger": "Grok must create expenses from chat and the operator wants no second switch",
+      "fallback": "none needed — set SPLITWISE_ALLOW_WRITES=1 in the unit's env file; the switch stays in the package"
+    }
+  ]
+}
