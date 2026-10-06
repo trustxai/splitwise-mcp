@@ -5,13 +5,20 @@ for 24 h because Splitwise never changes them between calls; `refresh=True` bypa
 cache. Three resolvers turn a name an LLM heard from a person ("Jon", "the Peru trip",
 "groceries") into the id every other tool needs, scored with stdlib
 `difflib.SequenceMatcher` on case- and accent-folded strings — no extra dependency.
+
+`SequenceMatcher.ratio()` ignores length and meaning ("daniela" scores 0.923 against
+"Daniel"), so a high score alone never picks a person or a group: friends and groups
+resolve ONLY on an exact match, a strong fuzzy candidate is reported as `probable`, and
+every resolver applies three guards before trusting a fuzzy candidate (query length,
+matching digit runs, no other candidate starting with the query).
 """
 
 from __future__ import annotations
 
+import re
 import time
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 from typing import Any
 
@@ -25,11 +32,18 @@ from splitwise_mcp.server import mcp
 
 MAX_DISPLAY_ROWS = 50
 CACHE_TTL_SECONDS = 24 * 60 * 60
-# A non-exact candidate counts as "resolved" only when it is the ONLY one at or above this.
+# A non-exact candidate needs at least this score to be `probable` (friends, groups) or
+# `unique_strong` (categories) — and it must be the only one, and pass the guards.
 RESOLVED_THRESHOLD = 0.85
+# A folded query shorter than this (spaces removed) never gets a fuzzy resolution.
+MIN_FUZZY_QUERY_LEN = 4
 MAX_RESOLVE_LIMIT = 25
 # Parent categories shown under the subcategory candidates in splitwise_resolve_category.
 PARENT_ROWS = 3
+
+_DIGIT_RUN_RE = re.compile(r"\d+")
+_PIECE_SPLIT_RE = re.compile(r"[/\s]+")
+_GROUP_ZERO_NOTE = " — pseudo-group: group_id 0 = no group"
 
 # path -> (monotonic fetch time, items). Only successful, non-empty answers are stored.
 _CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
@@ -46,7 +60,11 @@ def clear_cache() -> None:
 
 
 async def _cached_list(path: str, key: str, *, refresh: bool) -> tuple[list[dict[str, Any]], bool]:
-    """Return `(items, from_cache)` for a static catalogue endpoint, honouring the 24 h TTL."""
+    """Return `(items, from_cache)` for a static catalogue endpoint, honouring the 24 h TTL.
+
+    A failed or empty fetch raises / returns without touching the cache, so a warm entry
+    survives a failed `refresh`.
+    """
     entry = _CACHE.get(path)
     if not refresh and entry is not None and _now() - entry[0] < CACHE_TTL_SECONDS:
         return entry[1], True
@@ -77,27 +95,51 @@ def _fold(text: Any) -> str:
     return " ".join(bare.casefold().split())
 
 
-def _best_ratio(query: str, candidates: list[tuple[str, str]]) -> tuple[float, str]:
-    """Best `SequenceMatcher` ratio of the folded query against `(label, text)` candidates."""
-    best_score, best_label = 0.0, candidates[0][0] if candidates else ""
-    for label, text in candidates:
-        folded = _fold(text)
-        if not folded:
-            continue
-        score = SequenceMatcher(None, query, folded).ratio()
-        if score > best_score:
-            best_score, best_label = score, label
-    return best_score, best_label
+def _int_id(item: dict[str, Any]) -> int:
+    value = item.get("id")
+    return value if isinstance(value, int) else -1
+
+
+# ---------------------------------------------------------------------------
+# Scoring and resolution
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class _Match:
     score: float
     matched_on: str
+    matched_text: str
+    texts: tuple[str, ...]
     label: str
     item_id: int
     item: dict[str, Any]
     parent: dict[str, Any] | None = None
+
+
+def _match(
+    query: str,
+    fields: list[tuple[str, Any]],
+    *,
+    label: str,
+    item: dict[str, Any],
+    parent: dict[str, Any] | None = None,
+) -> _Match:
+    """Score `item` as the best `SequenceMatcher` ratio of the folded query over its `(label, text)` fields.
+
+    Earlier fields win ties, so list the most specific field first.
+    """
+    best_score, best_label, best_text = 0.0, fields[0][0] if fields else "", ""
+    texts: list[str] = []
+    for field_label, raw in fields:
+        text = _fold(raw)
+        if not text:
+            continue
+        texts.append(text)
+        score = SequenceMatcher(None, query, text).ratio()
+        if score > best_score:
+            best_score, best_label, best_text = score, field_label, text
+    return _Match(best_score, best_label, best_text, tuple(texts), label, _int_id(item), item, parent)
 
 
 def _rank(matches: list[_Match]) -> list[_Match]:
@@ -105,47 +147,100 @@ def _rank(matches: list[_Match]) -> list[_Match]:
     return sorted(matches, key=lambda m: (-m.score, m.label.casefold(), m.item_id))
 
 
-def _resolve(ranked: list[_Match]) -> tuple[_Match | None, str, int]:
-    """Decide whether one candidate is THE answer.
+def _digits_ok(query: str, match: _Match) -> bool:
+    """Guard (c): every digit run in the query is also a digit run of the matched text ("2025" ≠ "2026")."""
+    wanted = _DIGIT_RUN_RE.findall(query)
+    if not wanted:
+        return True
+    present = set(_DIGIT_RUN_RE.findall(match.matched_text))
+    return all(run in present for run in wanted)
 
-    Returns `(match, status, n)`: status is `exact` (exactly one 1.0 score), `unique_strong`
-    (no exact match and exactly one score ≥ RESOLVED_THRESHOLD), `ambiguous` (several exact
-    or several strong; `n` says how many) or `none`.
+
+@dataclass(frozen=True)
+class _Resolution:
+    status: str  # exact | probable | unique_strong | ambiguous | none
+    match: _Match | None  # the resolved (exact / unique_strong) or probable candidate
+    count: int  # candidates in contention when ambiguous
+    reason: str
+
+
+def _resolve(ranked: list[_Match], query: str, *, fuzzy_status: str, kind: str) -> _Resolution:
+    """Decide whether one candidate is THE answer; computed over ALL candidates, not just the top N.
+
+    1. Several exact (1.0) scores → `ambiguous`.
+    2. Otherwise the pick is the single exact match, or else the single candidate scoring
+       ≥ RESOLVED_THRESHOLD whose digit runs match the query's (guard c); several → `ambiguous`,
+       none → `none`.
+    3. Guard (d): another candidate with a scored text starting with the query → `ambiguous`.
+    4. An exact pick → `exact`. A fuzzy pick needs a query of ≥ MIN_FUZZY_QUERY_LEN characters
+       (guard b) and then becomes `fuzzy_status`: `probable` (friends, groups — never resolved)
+       or `unique_strong` (categories — resolved).
     """
     exact = [m for m in ranked if m.score >= 1.0]
-    if len(exact) == 1:
-        return exact[0], "exact", 1
     if len(exact) > 1:
-        return None, "ambiguous", len(exact)
-    strong = [m for m in ranked if m.score >= RESOLVED_THRESHOLD]
-    if len(strong) == 1:
-        return strong[0], "unique_strong", 1
-    if len(strong) > 1:
-        return None, "ambiguous", len(strong)
-    return None, "none", 0
-
-
-def _resolution_line(ranked: list[_Match], resolved: _Match | None, status: str, count: int, display: str) -> str:
-    if resolved is not None and status == "exact":
-        return f"**Resolved**: {display} — exact match on {resolved.matched_on}."
-    if resolved is not None:
-        return (
-            f"**Resolved**: {display} — the only candidate scoring ≥ {RESOLVED_THRESHOLD:.2f} "
-            f"({resolved.score:.3f}, on {resolved.matched_on})."
+        return _Resolution("ambiguous", None, len(exact), f"{len(exact)} candidates match exactly")
+    if exact:
+        pick = exact[0]
+    else:
+        strong = [m for m in ranked if m.score >= RESOLVED_THRESHOLD]
+        eligible = [m for m in strong if _digits_ok(query, m)]
+        if len(eligible) > 1:
+            return _Resolution(
+                "ambiguous", None, len(eligible), f"{len(eligible)} candidates score ≥ {RESOLVED_THRESHOLD:.2f}"
+            )
+        if not eligible:
+            if strong:
+                return _Resolution(
+                    "none", None, 0, "the closest candidates carry different numbers than the query (e.g. another year)"
+                )
+            return _Resolution("none", None, 0, f"no candidate scores ≥ {RESOLVED_THRESHOLD:.2f}")
+        pick = eligible[0]
+    rivals = [m for m in ranked if m is not pick and any(text.startswith(query) for text in m.texts)]
+    if rivals:
+        count = len(rivals) + 1
+        return _Resolution(
+            "ambiguous", None, count, f'{count} candidates could be meant: "{query}" is also how another name starts'
         )
-    if status == "ambiguous":
-        how = "match exactly" if ranked and ranked[0].score >= 1.0 else f"score ≥ {RESOLVED_THRESHOLD:.2f}"
-        return (
-            f"**Not resolved**: {count} candidates {how} — ask the user which one (or use the id) instead of guessing."
+    if pick.score >= 1.0:
+        return _Resolution("exact", pick, 1, f"exact match on {pick.matched_on}")
+    if len(query.replace(" ", "")) < MIN_FUZZY_QUERY_LEN:
+        return _Resolution(
+            "none", None, 0, f'"{query}" is under {MIN_FUZZY_QUERY_LEN} characters, too short to accept a fuzzy match'
         )
-    return (
-        f"**Not resolved**: no candidate scores ≥ {RESOLVED_THRESHOLD:.2f} — confirm with the user before "
-        "using any id below."
+    if fuzzy_status == "probable":
+        return _Resolution(
+            "probable",
+            pick,
+            1,
+            f"score {pick.score:.3f} on {pick.matched_on}; a {kind} resolves only on an exact match",
+        )
+    return _Resolution(
+        "unique_strong",
+        pick,
+        1,
+        f"the only candidate scoring ≥ {RESOLVED_THRESHOLD:.2f} ({pick.score:.3f}, on {pick.matched_on})",
     )
 
 
-def _resolve_payload(query: str, status: str, count: int) -> dict[str, Any]:
-    return {"query": query, "resolution": status, "ambiguous_count": count if status == "ambiguous" else 0}
+def _resolution_line(res: _Resolution, display: str) -> str:
+    if res.status in ("exact", "unique_strong"):
+        return f"**Resolved**: {display} — {res.reason}."
+    if res.status == "probable":
+        return (
+            f"**Not resolved.** Probable match — confirm with the user before using this id: {display} ({res.reason})."
+        )
+    if res.status == "ambiguous":
+        return f"**Not resolved**: {res.reason} — ask the user which one (or use the id) instead of guessing."
+    return f"**Not resolved**: {res.reason} — confirm with the user before using any id below."
+
+
+def _resolve_payload(query: str, res: _Resolution) -> dict[str, Any]:
+    return {
+        "query": query,
+        "resolution": res.status,
+        "ambiguous_count": res.count if res.status == "ambiguous" else 0,
+        "reason": res.reason,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -275,8 +370,9 @@ async def splitwise_get_categories(params: GetCategoriesInput) -> str:
         params = {"refresh": true, "response_format": "json"}
 
     Error Handling:
-    A 401 means the API key is missing or was regenerated. A failed fetch is never cached;
-    a parent filter that matches nothing lists the parent names to pick from.
+    A 401 means the API key is missing or was regenerated. A failed fetch is never cached
+    (a failed `refresh` keeps the previous cached list); a parent filter that matches
+    nothing lists the parent names to pick from.
     """
     try:
         categories, from_cache = await _cached_list("/get_categories", "categories", refresh=params.refresh)
@@ -287,7 +383,7 @@ async def splitwise_get_categories(params: GetCategoriesInput) -> str:
         if not categories:
             return "Splitwise returned no categories (an empty answer is not cached — try again later)."
         if not selected:
-            names = ", ".join(_named(c) for c in categories) or "none returned"
+            names = ", ".join(_named(c) for c in categories)
             return f"No parent category matches {needle!r}. Parent categories: {names}.\n\n{_source_note(from_cache)}"
         shown = selected[:MAX_DISPLAY_ROWS]
         lines = [
@@ -390,25 +486,39 @@ async def splitwise_get_currencies(params: GetCurrenciesInput) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Resolvers
+# Friends
 # ---------------------------------------------------------------------------
-
-
-def _int_id(item: dict[str, Any]) -> int:
-    value = item.get("id")
-    return value if isinstance(value, int) else -1
 
 
 def _score_friend(query: str, friend: dict[str, Any]) -> _Match:
     first = str(friend.get("first_name") or "")
     last = str(friend.get("last_name") or "")
     email = str(friend.get("email") or "")
-    score, matched_on = _best_ratio(
-        query,
-        [("full name", f"{first} {last}"), ("first name", first), ("email", email.split("@", 1)[0])],
-    )
     label = " ".join(p for p in (first, last) if p) or email or f"user {friend.get('id')}"
-    return _Match(score=score, matched_on=matched_on, label=label, item_id=_int_id(friend), item=friend)
+    return _match(
+        query,
+        [
+            ("full name", f"{first} {last}"),
+            ("first name", first),
+            ("last name", last),
+            ("email local-part", email.split("@", 1)[0]),
+            ("email", email),
+        ],
+        label=label,
+        item=friend,
+    )
+
+
+def _friend_brief(match: _Match) -> dict[str, Any]:
+    friend = match.item
+    return {
+        "id": friend.get("id"),
+        "first_name": friend.get("first_name"),
+        "last_name": friend.get("last_name"),
+        "email": friend.get("email"),
+        "score": round(match.score, 4),
+        "matched_on": match.matched_on,
+    }
 
 
 @mcp.tool(
@@ -426,14 +536,20 @@ async def splitwise_resolve_friend(params: ResolveFriendInput) -> str:
 
     Calls `GET /get_friends` (not cached — friends change) and scores every friend with
     `difflib.SequenceMatcher` on case- and accent-folded text: the best of "first last",
-    the first name, and the email local-part. Returns the top `limit` candidates with their
-    scores and says whether one is **resolved**: exactly one exact (1.000) match, or — with
-    no exact match — exactly one candidate scoring ≥ 0.85. Anything else is "not resolved":
-    ask the user rather than pick.
+    the first name, the last name, the email local-part and the full email. Returns the top
+    `limit` candidates with their scores.
+
+    A friend is **resolved ONLY on an exact match** (1.000 on one of those fields, for
+    exactly one friend, and no other friend's name or email starting with the query). A
+    wrong id here is a wrong person — the expense, the group membership or the deletion
+    lands on someone else — so a close-but-not-exact candidate ("Daniela" vs "Daniel",
+    0.923) is reported as **probable** and must be confirmed with the user. No fuzzy
+    candidate is offered for a query under 4 characters or whose numbers differ.
 
     When to Use:
-    - Before `splitwise_create_expense`, `splitwise_add_user_to_group` or
-      `splitwise_get_friend`, when the user named a person ("split it with Jon").
+    - Before `splitwise_create_expense`, `splitwise_add_user_to_group`,
+      `splitwise_get_friend` or `splitwise_delete_friend`, when the user named a person
+      ("split it with Jon").
 
     When NOT to Use:
     - For balances with each friend — use `splitwise_get_balances` / `splitwise_get_friends`.
@@ -443,9 +559,11 @@ async def splitwise_resolve_friend(params: ResolveFriendInput) -> str:
 
     Returns:
     The resolution line plus a markdown table (rank, `First Last (id N)`, email, score,
-    matched on); or, with `response_format` `json`, `{query, resolution, resolved,
-    candidates: [{id, first_name, last_name, email, score, matched_on}]}` where
-    `resolution` is `exact` | `unique_strong` | `ambiguous` | `none`.
+    matched on); or, with `response_format` `json`, `{query, resolution, ambiguous_count,
+    reason, resolved, probable, candidates: [{id, first_name, last_name, email, score,
+    matched_on}]}` where `resolution` is `exact` | `probable` | `ambiguous` | `none`,
+    `ambiguous_count` (always present, 0 unless ambiguous) says how many candidates are in
+    contention, `resolved` is set only for `exact`, and `probable` only for `probable`.
 
     Examples:
         params = {"query": "Jon"}
@@ -453,7 +571,7 @@ async def splitwise_resolve_friend(params: ResolveFriendInput) -> str:
 
     Error Handling:
     A 401 means the API key is missing or was regenerated. With no friends at all the tool
-    says so. A low score is never auto-accepted.
+    says so. Anything but `exact` means: ask the user, do not pick.
     """
     try:
         resp = await get_client().request("GET", "/get_friends")
@@ -462,11 +580,12 @@ async def splitwise_resolve_friend(params: ResolveFriendInput) -> str:
         friends = [f for f in raw if isinstance(f, dict)] if isinstance(raw, list) else []
         query = _fold(params.query)
         ranked = _rank([_score_friend(query, f) for f in friends])
-        resolved, status, count = _resolve(ranked)
+        res = _resolve(ranked, query, fuzzy_status="probable", kind="friend")
         top = ranked[: params.limit]
         if params.response_format is ResponseFormat.JSON:
-            payload = _resolve_payload(params.query, status, count)
-            payload["resolved"] = _friend_brief(resolved) if resolved else None
+            payload = _resolve_payload(params.query, res)
+            payload["resolved"] = _friend_brief(res.match) if res.match and res.status == "exact" else None
+            payload["probable"] = _friend_brief(res.match) if res.match and res.status == "probable" else None
             payload["candidates"] = [_friend_brief(m) for m in top]
             return clip_response(to_json(payload))
         if not friends:
@@ -474,7 +593,7 @@ async def splitwise_resolve_friend(params: ResolveFriendInput) -> str:
         lines = [
             f'# Friend matches for "{params.query}"',
             "",
-            _resolution_line(ranked, resolved, status, count, fmt_person(resolved.item) if resolved else ""),
+            _resolution_line(res, fmt_person(res.match.item) if res.match else ""),
             "",
             "| # | Friend | Email | Score | Matched on |",
             "|---|---|---|---|---|",
@@ -491,21 +610,18 @@ async def splitwise_resolve_friend(params: ResolveFriendInput) -> str:
         return handle_api_error(exc)
 
 
-def _friend_brief(match: _Match) -> dict[str, Any]:
-    friend = match.item
-    return {
-        "id": friend.get("id"),
-        "first_name": friend.get("first_name"),
-        "last_name": friend.get("last_name"),
-        "email": friend.get("email"),
-        "score": round(match.score, 4),
-        "matched_on": match.matched_on,
-    }
+# ---------------------------------------------------------------------------
+# Groups
+# ---------------------------------------------------------------------------
 
 
 def _members_count(group: dict[str, Any]) -> int:
     members = group.get("members")
     return len(members) if isinstance(members, list) else 0
+
+
+def _group_display(group: dict[str, Any]) -> str:
+    return _named(group) + (_GROUP_ZERO_NOTE if group.get("id") == 0 else "")
 
 
 def _group_brief(match: _Match) -> dict[str, Any]:
@@ -515,6 +631,7 @@ def _group_brief(match: _Match) -> dict[str, Any]:
         "name": group.get("name"),
         "group_type": group.get("group_type"),
         "members_count": _members_count(group),
+        "pseudo_group": group.get("id") == 0,
         "score": round(match.score, 4),
     }
 
@@ -534,13 +651,19 @@ async def splitwise_resolve_group(params: ResolveGroupInput) -> str:
 
     Calls `GET /get_groups` (not cached — groups change) and scores every group name with
     `difflib.SequenceMatcher` on case- and accent-folded text. Returns the top `limit`
-    candidates with their scores and says whether one is **resolved**: exactly one exact
-    (1.000) match, or — with no exact match — exactly one candidate scoring ≥ 0.85.
-    Group id 0 is Splitwise's pseudo-group for non-group expenses.
+    candidates with their scores. Group id 0 is Splitwise's pseudo-group for non-group
+    expenses (`group_id: 0` = no group).
+
+    A group is **resolved ONLY on an exact name match** (1.000, for exactly one group, and
+    no other group name starting with the query — "Peru trip" next to "Peru trip 2026" is
+    ambiguous). A close-but-not-exact name is reported as **probable** and must be
+    confirmed with the user; a query whose numbers differ ("peru trip 2025" vs "Peru trip
+    2026") or that is under 4 characters gets no fuzzy candidate at all.
 
     When to Use:
-    - Before `splitwise_create_expense`, `splitwise_get_group`, `splitwise_get_expenses` or
-      `splitwise_add_user_to_group`, when the user named a group ("the Peru trip").
+    - Before `splitwise_create_expense`, `splitwise_get_group`, `splitwise_get_expenses`,
+      `splitwise_add_user_to_group` or `splitwise_delete_group`, when the user named a
+      group ("the Peru trip").
 
     When NOT to Use:
     - To list every group with balances — use `splitwise_get_groups`.
@@ -548,8 +671,11 @@ async def splitwise_resolve_group(params: ResolveGroupInput) -> str:
 
     Returns:
     The resolution line plus a markdown table (rank, `Name (id N)`, type, members, score);
-    or, with `response_format` `json`, `{query, resolution, resolved, candidates: [{id,
-    name, group_type, members_count, score}]}`.
+    or, with `response_format` `json`, `{query, resolution, ambiguous_count, reason,
+    resolved, probable, candidates: [{id, name, group_type, members_count, pseudo_group,
+    score}]}` where `resolution` is `exact` | `probable` | `ambiguous` | `none`,
+    `ambiguous_count` (always present, 0 unless ambiguous) says how many candidates are in
+    contention, `resolved` is set only for `exact`, and `probable` only for `probable`.
 
     Examples:
         params = {"query": "peru trip"}
@@ -557,7 +683,7 @@ async def splitwise_resolve_group(params: ResolveGroupInput) -> str:
 
     Error Handling:
     A 401 means the API key is missing or was regenerated. With no groups the tool says
-    so. A low score is never auto-accepted.
+    so. Anything but `exact` means: ask the user, do not pick.
     """
     try:
         resp = await get_client().request("GET", "/get_groups")
@@ -565,17 +691,18 @@ async def splitwise_resolve_group(params: ResolveGroupInput) -> str:
         raw = body.get("groups") if isinstance(body, dict) else None
         groups = [g for g in raw if isinstance(g, dict)] if isinstance(raw, list) else []
         query = _fold(params.query)
-        matches = []
-        for group in groups:
-            name = str(group.get("name") or "")
-            score, _ = _best_ratio(query, [("name", name)])
-            matches.append(_Match(score, "name", name, _int_id(group), group))
-        ranked = _rank(matches)
-        resolved, status, count = _resolve(ranked)
+        ranked = _rank(
+            [
+                _match(query, [("name", group.get("name"))], label=str(group.get("name") or ""), item=group)
+                for group in groups
+            ]
+        )
+        res = _resolve(ranked, query, fuzzy_status="probable", kind="group")
         top = ranked[: params.limit]
         if params.response_format is ResponseFormat.JSON:
-            payload = _resolve_payload(params.query, status, count)
-            payload["resolved"] = _group_brief(resolved) if resolved else None
+            payload = _resolve_payload(params.query, res)
+            payload["resolved"] = _group_brief(res.match) if res.match and res.status == "exact" else None
+            payload["probable"] = _group_brief(res.match) if res.match and res.status == "probable" else None
             payload["candidates"] = [_group_brief(m) for m in top]
             return clip_response(to_json(payload))
         if not groups:
@@ -583,22 +710,36 @@ async def splitwise_resolve_group(params: ResolveGroupInput) -> str:
         lines = [
             f'# Group matches for "{params.query}"',
             "",
-            _resolution_line(ranked, resolved, status, count, _named(resolved.item) if resolved else ""),
+            _resolution_line(res, _group_display(res.match.item) if res.match else ""),
             "",
             "| # | Group | Type | Members | Score |",
             "|---|---|---|---|---|",
         ]
         for rank, match in enumerate(top, start=1):
             group = match.item
-            name = _named(group) + (" — pseudo-group: group_id 0 = no group" if group.get("id") == 0 else "")
             lines.append(
-                f"| {rank} | {_cell(name)} | {_cell(group.get('group_type') or '—')} | "
+                f"| {rank} | {_cell(_group_display(group))} | {_cell(group.get('group_type') or '—')} | "
                 f"{_members_count(group)} | {match.score:.3f} |"
             )
         lines.extend(["", f"_{len(top)} of {len(groups)} group(s) shown, best first._"])
         return clip_response("\n".join(lines))
     except Exception as exc:
         return handle_api_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Categories resolver
+# ---------------------------------------------------------------------------
+
+
+def _subcategory_fields(parent_name: str, sub_name: str) -> list[tuple[str, Any]]:
+    """The subcategory's name, each piece of it split on `/` and spaces, and "Parent Sub"."""
+    pieces = [piece for piece in _PIECE_SPLIT_RE.split(_fold(sub_name)) if piece]
+    fields: list[tuple[str, Any]] = [("name", sub_name)]
+    if len(pieces) > 1:
+        fields.extend(("name piece", piece) for piece in pieces)
+    fields.append(("parent + name", f"{parent_name} {sub_name}"))
+    return fields
 
 
 def _category_brief(match: _Match) -> dict[str, Any]:
@@ -633,12 +774,17 @@ async def splitwise_resolve_category(params: ResolveCategoryInput) -> str:
     Reads the categories from `GET /get_categories` through the same 24 h in-process cache
     as `splitwise_get_categories` (`refresh: true` refetches). Every **subcategory** is
     scored with `difflib.SequenceMatcher` on case- and accent-folded text — the best of its
-    own name and "Parent Subcategory" (so "transportation other" picks the right "Other").
+    name, each piece of the name split on `/` and spaces ("phone" → TV/Phone/Internet), and
+    "Parent Subcategory" (so "transportation other" picks the right "Other").
+
     Subcategories are listed first and are the only ones that can be **resolved**: exactly
-    one exact (1.000) match, or — with no exact match — exactly one scoring ≥ 0.85. The
-    closest parent categories follow, flagged "parent — not usable for expenses", with
-    their subcategories so you can pick one; a parent scores the better of its own name
-    and its best subcategory (so "groceries" surfaces "Food and drink").
+    one exact (1.000) match, or — with no exact match — exactly one scoring ≥ 0.85
+    (`unique_strong`; a wrong category is cheap to fix with `splitwise_update_expense`).
+    Either way no other subcategory may start with the query ("tax" next to Taxi and Taxes
+    is ambiguous), a fuzzy match needs a query of 4+ characters, and digits in the query
+    must match. The closest parent categories follow, flagged "parent — not usable for
+    expenses", with their subcategories so you can pick one; a parent scores the better of
+    its own name and its best subcategory (so "groceries" surfaces "Food and drink").
 
     When to Use:
     - Before `splitwise_create_expense` / `splitwise_update_expense`, when the user named
@@ -651,8 +797,11 @@ async def splitwise_resolve_category(params: ResolveCategoryInput) -> str:
     Returns:
     The resolution line, a markdown table of the top `limit` subcategories (rank,
     `Name (id N)`, parent, score, matched on), then up to 3 parents with their
-    subcategories; or, with `response_format` `json`, `{query, resolution, resolved,
-    subcategories: [...], parents: [...]}` where parents carry `usable_for_expenses: false`.
+    subcategories; or, with `response_format` `json`, `{query, resolution,
+    ambiguous_count, reason, resolved, subcategories: [...], parents: [...]}` where
+    `resolution` is `exact` | `unique_strong` | `ambiguous` | `none`, `ambiguous_count`
+    (always present, 0 unless ambiguous) says how many candidates are in contention, and
+    parents carry `usable_for_expenses: false`.
 
     Examples:
         params = {"query": "groceries"}
@@ -670,35 +819,35 @@ async def splitwise_resolve_category(params: ResolveCategoryInput) -> str:
         parent_matches: list[_Match] = []
         for parent in categories:
             parent_name = str(parent.get("name") or "")
-            parent_score, parent_on = _best_ratio(query, [("name", parent_name)])
+            own = _match(query, [("name", parent_name)], label=parent_name, item=parent)
+            best_score, best_on = own.score, own.matched_on
             for sub in _subcategories(parent):
                 sub_name = str(sub.get("name") or "")
-                score, matched_on = _best_ratio(
-                    query, [("name", sub_name), ("parent + name", f"{parent_name} {sub_name}")]
+                match = _match(
+                    query, _subcategory_fields(parent_name, sub_name), label=sub_name, item=sub, parent=parent
                 )
-                sub_matches.append(_Match(score, matched_on, sub_name, _int_id(sub), sub, parent=parent))
-                if score > parent_score:
-                    parent_score, parent_on = score, f"subcategory {sub_name}"
-            parent_matches.append(_Match(parent_score, parent_on, parent_name, _int_id(parent), parent))
+                sub_matches.append(match)
+                if match.score > best_score:
+                    best_score, best_on = match.score, f"subcategory {sub_name}"
+            parent_matches.append(replace(own, score=best_score, matched_on=best_on))
         ranked_subs = _rank(sub_matches)
-        resolved, status, count = _resolve(ranked_subs)
+        res = _resolve(ranked_subs, query, fuzzy_status="unique_strong", kind="category")
+        resolved = res.match if res.status in ("exact", "unique_strong") else None
         top_subs = ranked_subs[: params.limit]
         top_parents = _rank(parent_matches)[: min(params.limit, PARENT_ROWS)]
         if params.response_format is ResponseFormat.JSON:
-            payload = _resolve_payload(params.query, status, count)
+            payload = _resolve_payload(params.query, res)
             payload["resolved"] = _category_brief(resolved) if resolved else None
             payload["subcategories"] = [_category_brief(m) for m in top_subs]
             payload["parents"] = [_category_brief(m) for m in top_parents]
             return clip_response(to_json(payload))
         if not categories:
             return f'Splitwise returned no categories to match "{params.query}" against.'
-        resolved_display = ""
-        if resolved is not None:
-            resolved_display = f"{_named(resolved.item)} under {(resolved.parent or {}).get('name')}"
+        display = f"{_named(resolved.item)} under {(resolved.parent or {}).get('name')}" if resolved else ""
         lines = [
             f'# Category matches for "{params.query}"',
             "",
-            _resolution_line(ranked_subs, resolved, status, count, resolved_display),
+            _resolution_line(res, display),
             "",
             "## Subcategories (use one of these ids as `category_id`)",
             "",
