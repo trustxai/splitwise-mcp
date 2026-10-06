@@ -127,11 +127,15 @@ echoes exactly what Splitwise returned. Tool arguments are nested under a single
 
 - **[uv](https://docs.astral.sh/uv/)** — for the zero-install `uvx` path and for local
   development (Python 3.13+ is only needed for the clone path; `uvx` brings its own).
-- **A Splitwise API key.** Sign in at <https://secure.splitwise.com/apps> → **Register
-  your application** (any name, the URLs do not matter) → on the app's page click
+- **A Splitwise API key — which needs Splitwise Pro.** Splitwise only lets a **Pro**
+  subscriber register an application (the apps page shows "Get Splitwise Pro to
+  register an application" otherwise), and the key comes from the registered app. With
+  Pro active: sign in at <https://secure.splitwise.com/apps> → **Register your
+  application** (any name, the URLs do not matter) → on the app's page click
   **API key**. It is a personal access token for your whole account — read and write.
-  Regenerate it on the same page to rotate. The self-serve API is for personal use;
-  commercial use needs a licence from Splitwise (see their terms on dev.splitwise.com).
+  Regenerate it on the same page to rotate; if Pro lapses, the key stops working (401)
+  until you resubscribe. The self-serve API is for personal use; commercial use needs a
+  licence from Splitwise (see their terms on dev.splitwise.com).
 - **(Optional) Docker** if you prefer the container path.
 
 ## Quickstart
