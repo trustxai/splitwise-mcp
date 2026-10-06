@@ -55,6 +55,11 @@ class Settings(BaseSettings):
     # Comma-separated Host header values accepted (DNS-rebinding protection), e.g.
     # `ax42.tail8f6c35.ts.net,127.0.0.1:8765`. Empty = protection off (loopback only).
     splitwise_mcp_allowed_hosts: str = ""
+    # Comma-separated extra `Origin` values accepted when host pinning is on (the SDK
+    # rejects any Origin it does not know with 403). The transport already mirrors the
+    # allowed hosts as origins; this is the escape hatch for a cloud client that sends
+    # its own Origin (e.g. `https://grok.com`). Ignored when SPLITWISE_MCP_ALLOWED_HOSTS is empty.
+    splitwise_mcp_allowed_origins: str = ""
     # Stateless streamable-http (no server-side session ids) — the mode that survives
     # cloud clients and reverse proxies best.
     splitwise_mcp_stateless: bool = True
@@ -69,6 +74,7 @@ class Settings(BaseSettings):
         "splitwise_mcp_host",
         "splitwise_mcp_path",
         "splitwise_mcp_allowed_hosts",
+        "splitwise_mcp_allowed_origins",
         mode="before",
     )
     @classmethod
@@ -84,15 +90,24 @@ class Settings(BaseSettings):
         """Effective REST base without a trailing slash."""
         return self.splitwise_api_url.rstrip("/")
 
+    @staticmethod
+    def _split_csv(value: str) -> list[str]:
+        seen: list[str] = []
+        for raw in value.split(","):
+            item = raw.strip()
+            if item and item not in seen:
+                seen.append(item)
+        return seen
+
     @property
     def allowed_hosts(self) -> list[str]:
         """`SPLITWISE_MCP_ALLOWED_HOSTS` as a de-duplicated list (order kept, blanks dropped)."""
-        seen: list[str] = []
-        for raw in self.splitwise_mcp_allowed_hosts.split(","):
-            host = raw.strip()
-            if host and host not in seen:
-                seen.append(host)
-        return seen
+        return self._split_csv(self.splitwise_mcp_allowed_hosts)
+
+    @property
+    def allowed_origins(self) -> list[str]:
+        """`SPLITWISE_MCP_ALLOWED_ORIGINS` as a de-duplicated list (order kept, blanks dropped)."""
+        return self._split_csv(self.splitwise_mcp_allowed_origins)
 
     @property
     def host_is_loopback(self) -> bool:
