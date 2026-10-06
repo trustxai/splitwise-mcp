@@ -44,9 +44,23 @@ async def test_every_registered_tool_has_name_prefix_and_annotations() -> None:
         assert tool.description, tool.name
 
 
-def test_http_entry_point_is_wired_to_the_stub() -> None:
-    with pytest.raises(NotImplementedError, match="t5-http-transport"):
+def test_http_entry_point_is_wired_to_serve(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The real serve() refuses to start without a bearer, before touching the singleton.
+    started: list[object] = []
+    monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: started.append(args))
+    with pytest.raises(SystemExit) as excinfo:
         main_http()
+    assert excinfo.value.code == 2
+    assert started == []
+    assert "SPLITWISE_MCP_BEARER" in capsys.readouterr().err
+
+    # main_http() hands the module singleton to splitwise_mcp.http.serve.
+    received: list[object] = []
+    monkeypatch.setattr("splitwise_mcp.http.serve", received.append)
+    main_http()
+    assert received == [mcp]
 
 
 def test_console_scripts_declared() -> None:
