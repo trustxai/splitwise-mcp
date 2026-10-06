@@ -14,10 +14,11 @@ from __future__ import annotations
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+import httpx
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from splitwise_mcp.client import get_client
+from splitwise_mcp.client import SplitwiseEnvelopeError, get_client
 from splitwise_mcp.errors import format_errors, handle_api_error
 from splitwise_mcp.formatters import ResponseFormat, clip_response, fmt_money, fmt_person, iso_to_human, to_json
 from splitwise_mcp.server import mcp
@@ -26,6 +27,12 @@ MAX_DISPLAY_ROWS = 50
 MAX_BATCH_FRIENDS = 50
 
 SIGN_CONVENTION = "Sign convention: positive = they owe you; negative = you owe them."
+
+# `/create_friends` can add some entries and reject others in the same 200 response; the
+# client then raises on the non-empty `errors`, so the error alone would read as "nobody added".
+PARTIAL_ADD_HINT = (
+    "Some of the requested friends may already have been added — call splitwise_get_friends before retrying."
+)
 
 # Deliberately loose: Splitwise is the authority on e-mail validity; this only catches
 # obvious slips (a name pasted into the e-mail field, a missing domain).
@@ -176,7 +183,9 @@ def _nonzero_balances(balances: Any) -> list[dict[str, Any]]:
 
 
 def _fmt_balances(balances: Any) -> str:
-    """Render a balance list as `+12.50 USD, -3.00 PEN` (or `settled up`)."""
+    """Render a balance list as `+12.50 USD, -3.00 PEN` (`settled up` if all zero, `N/A` if absent)."""
+    if not isinstance(balances, list):
+        return "N/A"
     nonzero = _nonzero_balances(balances)
     if not nonzero:
         return "settled up"
@@ -283,13 +292,16 @@ async def splitwise_get_friends(params: GetFriendsInput) -> str:
             )
 
         lines = ["# Splitwise friends", "", SIGN_CONVENTION, ""]
+        count = f"**{len(friends)}** friend(s)"
         if params.only_with_balance:
-            lines.append(f"Showing **{len(friends)}** friend(s) with a non-zero balance (of {total} friends).")
+            count += f" with a non-zero balance (of {total} friends)"
+        if len(friends) > MAX_DISPLAY_ROWS:
+            lines.append(f"{count}; showing the first {MAX_DISPLAY_ROWS}.")
         else:
-            lines.append(f"Showing **{len(friends)}** friend(s).")
+            lines.append(f"Showing {count}.")
         if not friends:
             lines.extend(["", "_No friends with a non-zero balance._" if params.only_with_balance else "_No friends._"])
-            return "\n".join(lines)
+            return clip_response("\n".join(lines))
 
         shown = friends[:MAX_DISPLAY_ROWS]
         lines.extend(["", "| Friend | Email | Status | Balance |", "|---|---|---|---|"])
@@ -378,9 +390,11 @@ async def splitwise_create_friend(params: CreateFriendInput) -> str:
     Calls `POST /create_friend` with `user_email` (+ `user_first_name` /
     `user_last_name` when given). If an account already exists for that e-mail the
     names are ignored; if not, Splitwise creates an invited user and `user_first_name`
-    is required. Refused with `Error: … writes are disabled` unless
-    `SPLITWISE_ALLOW_WRITES=1`. There is no undo tool; remove a friend with
-    `splitwise_delete_friend`.
+    is required. If you don't know whether they have an account, pass `user_first_name`;
+    it is ignored for existing users. Adding someone without an account probably sends
+    them an invitation e-mail (unverified; the live smoke t10 confirms). Refused with
+    `Error: … writes are disabled` unless `SPLITWISE_ALLOW_WRITES=1`. There is no undo
+    tool; remove a friend with `splitwise_delete_friend`.
 
     When to Use:
     - To befriend one person so you can share non-group expenses with them.
@@ -497,7 +511,10 @@ async def splitwise_create_friends(params: CreateFriendsInput) -> str:
         lines.append(f"- **errors**: {format_errors(body.get('errors')) or 'none'}")
         return clip_response("\n".join(lines))
     except Exception as exc:
-        return handle_api_error(exc)
+        message = handle_api_error(exc)
+        if isinstance(exc, SplitwiseEnvelopeError | httpx.HTTPStatusError):
+            message += f"\n{PARTIAL_ADD_HINT}"
+        return message
 
 
 @mcp.tool(
@@ -524,8 +541,9 @@ async def splitwise_delete_friend(params: DeleteFriendInput) -> str:
 
     When NOT to Use:
     - To remove someone from a group (use `splitwise_remove_user_from_group`).
-    - To settle a balance (record a payment expense with `splitwise_create_expense`).
-    - When the id is uncertain — confirm it first with `splitwise_get_friend`.
+    - To settle a balance (record the repayment as an expense via `splitwise_create_expense`).
+    - When the id is uncertain — confirm it first with `splitwise_resolve_friend` or
+      `splitwise_get_friend`.
 
     Returns:
     A confirmation with the user id and the body's `success` value.

@@ -9,11 +9,12 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
-from splitwise_mcp.client import SplitwiseEnvelopeError, WritesDisabledError
-from splitwise_mcp.config import get_settings
+from splitwise_mcp.client import SplitwiseClient, SplitwiseEnvelopeError, WritesDisabledError
+from splitwise_mcp.config import Settings, get_settings
 from splitwise_mcp.server import mcp
 from splitwise_mcp.tools.friends import (
     MAX_DISPLAY_ROWS,
+    PARTIAL_ADD_HINT,
     CreateFriendInput,
     CreateFriendsInput,
     DeleteFriendInput,
@@ -107,14 +108,28 @@ async def test_get_friends_markdown_renders_rows_and_sign_convention(monkeypatch
 
 
 async def test_get_friends_only_with_balance_filters(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake = _FakeClient(routes={"/get_friends": {"friends": [GRACE, ALAN]}})
+    empty_balance = {**ALAN, "id": 6000, "first_name": "Edsger", "balance": []}
+    fake = _FakeClient(routes={"/get_friends": {"friends": [GRACE, ALAN, empty_balance]}})
     _use(monkeypatch, fake)
 
     result = await splitwise_get_friends(GetFriendsInput(only_with_balance=True))
 
-    assert "Showing **1** friend(s) with a non-zero balance (of 2 friends)." in result
+    assert "Showing **1** friend(s) with a non-zero balance (of 3 friends)." in result
     assert "Grace Hopper (id 4821)" in result
     assert "Alan (id 5150)" not in result
+    assert "Edsger (id 6000)" not in result
+
+
+async def test_get_friends_missing_balance_renders_na(monkeypatch: pytest.MonkeyPatch) -> None:
+    no_balance = {key: value for key, value in ALAN.items() if key != "balance"}
+    empty_balance = {**ALAN, "id": 6000, "first_name": "Edsger", "balance": []}
+    fake = _FakeClient(routes={"/get_friends": {"friends": [no_balance, empty_balance]}})
+    _use(monkeypatch, fake)
+
+    result = await splitwise_get_friends(GetFriendsInput())
+
+    assert "| Alan (id 5150) | alan@example.com | invited | N/A |" in result
+    assert "| Edsger (id 6000) | alan@example.com | invited | settled up |" in result
 
 
 async def test_get_friends_only_with_balance_empty(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -150,7 +165,8 @@ async def test_get_friends_caps_display_rows(monkeypatch: pytest.MonkeyPatch) ->
 
     result = await splitwise_get_friends(GetFriendsInput())
 
-    assert f"Showing **{MAX_DISPLAY_ROWS + 5}** friend(s)." in result
+    assert f"**{MAX_DISPLAY_ROWS + 5}** friend(s); showing the first {MAX_DISPLAY_ROWS}." in result
+    assert "Showing **" not in result
     assert f"Friend{MAX_DISPLAY_ROWS - 1} (id {1000 + MAX_DISPLAY_ROWS - 1})" in result
     assert f"Friend{MAX_DISPLAY_ROWS} (id" not in result
     assert "_5 more friend(s) not shown (display cap 50)" in result
@@ -327,7 +343,70 @@ async def test_create_friends_envelope_error_is_reported(monkeypatch: pytest.Mon
         CreateFriendsInput.model_validate({"friends": [{"email": "alan@example.com"}]})
     )
 
-    assert result == "Error: Splitwise rejected the request to /create_friends: alan@example is not a valid email"
+    assert result == (
+        "Error: Splitwise rejected the request to /create_friends: alan@example is not a valid email\n"
+        f"{PARTIAL_ADD_HINT}"
+    )
+
+
+def _real_client(handler: Any) -> SplitwiseClient:
+    settings = Settings(splitwise_api_key="k" * 20, splitwise_allow_writes=True)
+    return SplitwiseClient(settings=settings, transport=httpx.MockTransport(handler))
+
+
+async def test_create_friends_partial_success_through_real_client_warns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 200 that added Grace but rejected Bob must not read as 'nobody was added'."""
+    seen: list[tuple[str, str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={"users": [GRACE], "errors": {"base": ["bob@example.com could not be added"]}})
+
+    client = _real_client(handler)
+    monkeypatch.setattr("splitwise_mcp.tools.friends.get_client", lambda: client)
+
+    result = await splitwise_create_friends(
+        CreateFriendsInput.model_validate({"friends": [{"email": "grace@example.com"}, {"email": "bob@example.com"}]})
+    )
+
+    assert seen == [
+        (
+            "POST",
+            "/api/v3.0/create_friends",
+            {"users__0__email": "grace@example.com", "users__1__email": "bob@example.com"},
+        )
+    ]
+    assert result.startswith("Error: Splitwise rejected the request to /create_friends: bob@example.com could not")
+    assert result.endswith(PARTIAL_ADD_HINT)
+
+
+async def test_create_friends_http_400_through_real_client_warns(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"users": [], "errors": {"base": ["bob@example is not a valid email"]}})
+
+    client = _real_client(handler)
+    monkeypatch.setattr("splitwise_mcp.tools.friends.get_client", lambda: client)
+
+    result = await splitwise_create_friends(
+        CreateFriendsInput.model_validate({"friends": [{"email": "bob@example.com"}]})
+    )
+
+    assert result.startswith("Error (400): Bad request – bob@example is not a valid email.")
+    assert result.endswith(PARTIAL_ADD_HINT)
+
+
+async def test_create_friends_writes_disabled_has_no_partial_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeClient(
+        exc=WritesDisabledError("POST /create_friends would change your account, but writes are disabled.")
+    )
+    _use(monkeypatch, fake)
+
+    result = await splitwise_create_friends(
+        CreateFriendsInput.model_validate({"friends": [{"email": "bob@example.com"}]})
+    )
+
+    assert "writes are disabled" in result
+    assert PARTIAL_ADD_HINT not in result
 
 
 def test_create_friends_input_rejects_duplicate_emails() -> None:
